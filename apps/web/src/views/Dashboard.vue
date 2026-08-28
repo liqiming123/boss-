@@ -1,0 +1,3 @@
+<script setup lang="ts">import{onMounted,ref}from'vue';import{useAuthStore}from'../stores/auth';const data=ref<Record<string,number>>({}),loading=ref(true),auth=useAuthStore();onMounted(async()=>{try{data.value=await auth.client.request('/admin/overview')}finally{loading.value=false}});const labels:Record<string,string>={candidate_queries:'候选人查询',engagements:'新增跟进',open_conflicts:'未处理冲突',interviews:'已约面',unmapped_jobs:'未映射岗位',notification_failures:'通知失败'};</script>
+<template><div v-loading="loading" class="page-card"><div class="metric-grid"><div class="metric" v-for="(value,key) in data" :key="key"><span>{{labels[key]??key}}</span><strong>{{value}}</strong></div></div></div></template>
+

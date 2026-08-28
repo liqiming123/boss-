@@ -1,0 +1,4 @@
+import type{AccountData,CandidateData,Extraction,JobData,RecruitmentSiteAdapter}from'../types';import{observeBossPage}from'./boss-observer';import{bossDiagnostic}from'./boss-diagnostics';
+const unavailable=<T>():Extraction<T>=>({status:'ERROR',errorCode:'BOSS_SELECTORS_UNCONFIGURED'});
+export class BossAdapter implements RecruitmentSiteAdapter{readonly platform='boss';canHandle(url:string){try{return new URL(url).hostname.endsWith('zhipin.com')}catch{return false}}async extractAccount():Promise<Extraction<AccountData>>{return unavailable()}async extractCandidate():Promise<Extraction<CandidateData>>{return unavailable()}async extractJob():Promise<Extraction<JobData>>{return unavailable()}observePageChange(callback:()=>void){return observeBossPage(callback)}async getDiagnostics(){return bossDiagnostic()}}
+

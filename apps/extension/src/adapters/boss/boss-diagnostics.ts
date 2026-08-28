@@ -1,0 +1,2 @@
+import{bossSelectors}from'./boss-selectors';export function bossDiagnostic(){return{platform:'boss',adapterVersion:'boss-adapter-unconfigured-1',pageType:location.pathname,accountStatus:'UNCONFIGURED',candidateStatus:'UNCONFIGURED',jobStatus:'UNCONFIGURED',platformIdStatus:'UNCONFIGURED',errorCodes:['BOSS_SELECTORS_UNCONFIGURED'],sanitizedContext:{configuredSelectorGroups:Object.values(bossSelectors).filter(v=>v.length).length,pathHash:'not-collected'}}}
+

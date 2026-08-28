@@ -1,0 +1,1 @@
+import{describe,expect,it}from'vitest';import{BossAdapter}from'../src/adapters/boss/boss-adapter';describe('Boss adapter',()=>{it('never invents selectors',async()=>{const result=await new BossAdapter().extractCandidate();expect(result).toEqual({status:'ERROR',errorCode:'BOSS_SELECTORS_UNCONFIGURED'})})});

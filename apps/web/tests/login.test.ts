@@ -1,0 +1,2 @@
+import{mount}from'@vue/test-utils';import{createPinia,setActivePinia}from'pinia';import{beforeEach,describe,expect,it,vi}from'vitest';import Login from '../src/views/Login.vue';
+vi.mock('vue-router',()=>({useRouter:()=>({push:vi.fn()})}));beforeEach(()=>setActivePinia(createPinia()));describe('Login',()=>{it('renders development account',()=>{const wrapper=mount(Login,{global:{stubs:{'el-form':{template:'<form><slot/></form>'},'el-form-item':{template:'<div><slot/></div>'},'el-input':true,'el-button':true}}});expect(wrapper.text()).toContain('招聘协同平台')})});

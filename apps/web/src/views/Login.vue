@@ -1,0 +1,4 @@
+<script setup lang="ts">import{ref}from'vue';import{useRouter}from'vue-router';import{ElMessage}from'element-plus';import{useAuthStore}from'../stores/auth';
+const email=ref('admin@example.com'),password=ref('dev-admin-2026'),loading=ref(false),auth=useAuthStore(),router=useRouter();async function submit(){loading.value=true;try{await auth.login(email.value,password.value);router.push('/recruitment/overview')}catch(e){ElMessage.error(e instanceof Error?e.message:'登录失败')}finally{loading.value=false}}</script>
+<template><div class="login-page"><div class="login-card"><h2>招聘协同平台</h2><p>内部人员登录</p><el-form label-position="top" @submit.prevent="submit"><el-form-item label="邮箱"><el-input v-model="email"/></el-form-item><el-form-item label="密码"><el-input v-model="password" type="password" show-password/></el-form-item><el-button type="primary" native-type="submit" :loading="loading" style="width:100%">登录</el-button></el-form></div></div></template>
+
