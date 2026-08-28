@@ -1,0 +1,13 @@
+services:
+  postgres:
+    restart: unless-stopped
+    ports: []
+  api:
+    restart: unless-stopped
+    environment: {APP_ENV: production}
+    ports: []
+  worker: {restart: unless-stopped}
+  web:
+    restart: unless-stopped
+    ports: ["80:80"]
+  mock-site: {profiles: ["never"]}
