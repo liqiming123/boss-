@@ -1,0 +1,2 @@
+"""Recruitment collaboration platform."""
+

@@ -1,0 +1,9 @@
+packages:
+  - apps/web
+  - apps/extension
+  - apps/mock-recruitment-site
+  - packages/api-client
+onlyBuiltDependencies:
+  - esbuild
+allowBuilds:
+  esbuild: true

@@ -1,0 +1,11 @@
+{
+  "name": "@recruitment/api-client",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {"build": "tsc -p tsconfig.json", "test": "vitest run --passWithNoTests", "lint": "eslint src", "typecheck": "tsc --noEmit"},
+  "dependencies": {"zod": "^4.1.5"},
+  "devDependencies": {"@eslint/js": "^9.34.0", "eslint": "^9.34.0", "typescript": "^5.9.2", "typescript-eslint": "^8.41.0", "vitest": "^3.2.4"}
+}
+

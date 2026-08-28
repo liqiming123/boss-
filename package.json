@@ -1,0 +1,16 @@
+{
+  "name": "recruitment-collab-platform",
+  "private": true,
+  "packageManager": "pnpm@10.19.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "typecheck": "pnpm -r typecheck",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2"
+  }
+}

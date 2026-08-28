@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+*.db
+*.tsbuildinfo
+*.vue.js
+tests/*.js
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+.DS_Store
