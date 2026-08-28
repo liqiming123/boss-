@@ -5,10 +5,12 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.pyc
+*.egg-info/
 *.db
 *.tsbuildinfo
 *.vue.js
 tests/*.js
+apps/mock-recruitment-site/src/*.js
 node_modules/
 dist/
 coverage/
