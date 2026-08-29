@@ -11,7 +11,14 @@ class Settings(BaseSettings):
     app_env: str = "development"
     secret_key: str = "development-only-secret-key-change-me"
     database_url: str = "sqlite:///./recruitment_dev.db"
-    cors_origins: List[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    cors_origins: List[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://localhost:5174",
+            "http://127.0.0.1:5173",
+            "http://127.0.0.1:5174",
+        ]
+    )
     access_token_minutes: int = 30
     refresh_token_days: int = 30
     feishu_mode: str = "mock"
@@ -36,4 +43,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
