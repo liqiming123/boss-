@@ -5,6 +5,7 @@ import time
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
+from recruitment_collab.config.settings import get_settings
 from recruitment_collab.infrastructure.database import Base
 from recruitment_collab.infrastructure.feishu import FeishuCallbackVerifier
 from recruitment_collab.infrastructure.models import Company, MockFeishuMessage, NotificationOutbox, Recruiter
@@ -52,6 +53,8 @@ def test_mock_worker_delivers_and_persists_message(tmp_path, monkeypatch):
         )
         db.commit()
     monkeypatch.setattr(notification_worker, "SessionLocal", factory)
+    mock_settings = get_settings().model_copy(update={"app_env": "test", "feishu_mode": "mock"})
+    monkeypatch.setattr(notification_worker, "get_settings", lambda: mock_settings)
     assert asyncio.run(notification_worker.process_batch()) == 1
     with factory() as db:
         outbox = db.scalar(select(NotificationOutbox))

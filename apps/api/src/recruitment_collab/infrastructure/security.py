@@ -28,11 +28,21 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def make_token(subject: str, company_id: str, role: str, kind: str = "access") -> str:
+def make_token(subject: str, company_id: str, role: str, kind: str = "access", device_id: str | None = None) -> str:
     settings = get_settings()
     now = datetime.now(timezone.utc)
     lifetime = timedelta(minutes=settings.access_token_minutes) if kind == "access" else timedelta(days=settings.refresh_token_days)
-    payload: dict[str, Any] = {"sub": subject, "company_id": company_id, "role": role, "type": kind, "iat": now, "exp": now + lifetime, "jti": secrets.token_hex(12)}
+    payload: dict[str, Any] = {
+        "sub": subject,
+        "company_id": company_id,
+        "role": role,
+        "type": kind,
+        "iat": now,
+        "exp": now + lifetime,
+        "jti": secrets.token_hex(12),
+    }
+    if device_id:
+        payload["device_id"] = device_id
     return jwt.encode(payload, settings.secret_key, algorithm="HS256")
 
 
@@ -41,4 +51,3 @@ def decode_token(token: str, expected_kind: str = "access") -> dict[str, Any]:
     if payload.get("type") != expected_kind:
         raise jwt.InvalidTokenError("token type mismatch")
     return payload
-

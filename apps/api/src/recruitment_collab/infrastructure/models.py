@@ -36,10 +36,28 @@ class Recruiter(Base, TimestampMixin):
     display_name: Mapped[str] = mapped_column(String(100))
     feishu_open_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     feishu_user_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    feishu_display_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     email: Mapped[str] = mapped_column(String(200), unique=True)
     password_hash: Mapped[str] = mapped_column(String(300))
     role: Mapped[str] = mapped_column(String(30), default="RECRUITER")
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+
+
+class FeishuBindingAttempt(Base):
+    __tablename__ = "recruitment_feishu_binding_attempts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    account_display_name: Mapped[str] = mapped_column(String(100))
+    action: Mapped[str] = mapped_column(String(20))
+    state_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    recruiter_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_recruiters.id"), nullable=True)
+    device_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    device_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    device_poll_token_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class RecruitmentAccount(Base, TimestampMixin):
@@ -52,7 +70,6 @@ class RecruitmentAccount(Base, TimestampMixin):
     platform_account_key: Mapped[str] = mapped_column(String(200))
     account_display_name: Mapped[str] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
-    last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class RecruitmentJob(Base, TimestampMixin):
@@ -85,7 +102,6 @@ class UnmappedJob(Base, TimestampMixin):
     platform: Mapped[str] = mapped_column(String(30))
     raw_job_name: Mapped[str] = mapped_column(String(120))
     normalized_job_name: Mapped[str] = mapped_column(String(120))
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     occurrence_count: Mapped[int] = mapped_column(Integer, default=1)
     resolved_job_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_jobs.id"), nullable=True)
@@ -102,7 +118,7 @@ class CandidateSource(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
     company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
     platform: Mapped[str] = mapped_column(String(30))
-    platform_account_id: Mapped[str] = mapped_column(ForeignKey("recruitment_accounts.id"), index=True)
+    platform_account_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_accounts.id"), nullable=True, index=True)
     source_identity_key: Mapped[str] = mapped_column(String(64), index=True)
     source_identity_type: Mapped[str] = mapped_column(String(30))
     platform_candidate_id: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
@@ -110,11 +126,29 @@ class CandidateSource(Base, TimestampMixin):
     page_url_hash: Mapped[str] = mapped_column(String(64))
     candidate_display_name: Mapped[str] = mapped_column(String(120))
     candidate_normalized_name: Mapped[str] = mapped_column(String(120))
+    candidate_age: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    candidate_experience: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    candidate_education: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    candidate_identity_signature: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    conversation_job_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     raw_job_name: Mapped[str] = mapped_column(String(120))
     job_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_jobs.id"), nullable=True)
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    conversation_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    conversation_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     extractor_version: Mapped[str] = mapped_column(String(80))
+    feishu_record_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    recruitment_status: Mapped[str] = mapped_column(String(30), default="沟通中")
+    status_evidence: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    status_rule_version: Mapped[str] = mapped_column(String(20), default="boss-status-v1")
+    snapshot_tokens_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    snapshot_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    snapshot_status: Mapped[str] = mapped_column(String(20), default="NONE")
+    resume_tokens_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    resume_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    resume_status: Mapped[str] = mapped_column(String(30), default="NONE")
+    resume_file_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    data_minimized_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Engagement(Base, TimestampMixin):
@@ -125,15 +159,11 @@ class Engagement(Base, TimestampMixin):
     candidate_source_id: Mapped[str] = mapped_column(ForeignKey("recruitment_candidate_sources.id"), index=True)
     job_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_jobs.id"), nullable=True, index=True)
     recruiter_id: Mapped[str] = mapped_column(ForeignKey("recruitment_recruiters.id"), index=True)
-    recruitment_account_id: Mapped[str] = mapped_column(ForeignKey("recruitment_accounts.id"))
+    recruitment_account_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_accounts.id"), nullable=True)
     owner_recruiter_id: Mapped[str] = mapped_column(ForeignKey("recruitment_recruiters.id"))
     stage: Mapped[str] = mapped_column(String(40), index=True)
     first_contact_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-    next_follow_up_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    rejection_scope: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
-    rejection_reason_code: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
-    rejection_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
 
 
@@ -182,9 +212,6 @@ class Conflict(Base, TimestampMixin):
     conflict_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     status: Mapped[str] = mapped_column(String(40), default="OPEN")
     resolution: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    notification_version: Mapped[int] = mapped_column(Integer, default=1)
-    last_notified_version: Mapped[int] = mapped_column(Integer, default=0)
-    first_detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     last_detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     resolved_by: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_recruiters.id"), nullable=True)
@@ -211,7 +238,6 @@ class NotificationOutbox(Base, TimestampMixin):
     aggregate_type: Mapped[str] = mapped_column(String(50))
     aggregate_id: Mapped[str] = mapped_column(String(36))
     recipient_recruiter_id: Mapped[str] = mapped_column(ForeignKey("recruitment_recruiters.id"))
-    channel: Mapped[str] = mapped_column(String(20), default="FEISHU")
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     idempotency_key: Mapped[str] = mapped_column(String(120), unique=True)
     status: Mapped[str] = mapped_column(String(20), default="PENDING")
@@ -219,6 +245,55 @@ class NotificationOutbox(Base, TimestampMixin):
     next_retry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+
+class DuplicateLookupAlert(Base, TimestampMixin):
+    __tablename__ = "recruitment_duplicate_lookup_alerts"
+    __table_args__ = (
+        UniqueConstraint("alert_key"),
+        Index("ix_lookup_alert_company_detected", "company_id", "last_detected_at"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    viewer_recruiter_id: Mapped[str] = mapped_column(ForeignKey("recruitment_recruiters.id"), index=True)
+    matched_recruiter_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_recruiters.id"), nullable=True, index=True)
+    matched_recruiter_name: Mapped[str] = mapped_column(String(100))
+    candidate_identity_hash: Mapped[str] = mapped_column(String(64))
+    normalized_job_name: Mapped[str] = mapped_column(String(120))
+    alert_key: Mapped[str] = mapped_column(String(64))
+    match_level: Mapped[str] = mapped_column(String(40))
+    evidence_rank: Mapped[int] = mapped_column(Integer)
+    match_reason: Mapped[str] = mapped_column(String(300))
+    notification_version: Mapped[int] = mapped_column(Integer, default=0)
+    hit_count: Mapped[int] = mapped_column(Integer, default=1)
+    last_detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    last_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CandidateSyncOutbox(Base, TimestampMixin):
+    __tablename__ = "recruitment_candidate_sync_outbox"
+    __table_args__ = (UniqueConstraint("candidate_source_id"), Index("ix_candidate_sync_due", "status", "next_retry_at"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    candidate_source_id: Mapped[str] = mapped_column(ForeignKey("recruitment_candidate_sources.id"), index=True)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    payload_version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+
+class ConversationScanCheckpoint(Base, TimestampMixin):
+    __tablename__ = "recruitment_conversation_scan_checkpoints"
+    __table_args__ = (UniqueConstraint("company_id", "platform", "account_display_name"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    platform: Mapped[str] = mapped_column(String(30), default="boss")
+    account_display_name: Mapped[str] = mapped_column(String(100))
+    completed_through_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    cursor_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class Notification(Base, TimestampMixin):
@@ -231,8 +306,6 @@ class Notification(Base, TimestampMixin):
     provider_message_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     status: Mapped[str] = mapped_column(String(20))
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    error_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    error_message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
 
 class PluginDevice(Base, TimestampMixin):
@@ -248,25 +321,23 @@ class PluginDevice(Base, TimestampMixin):
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class DeviceCode(Base, TimestampMixin):
-    __tablename__ = "recruitment_device_codes"
+class WorkerHeartbeat(Base):
+    __tablename__ = "recruitment_worker_heartbeats"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
-    device_code_hash: Mapped[str] = mapped_column(String(128), unique=True)
-    user_code: Mapped[str] = mapped_column(String(12), unique=True)
-    status: Mapped[str] = mapped_column(String(20), default="PENDING")
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    recruiter_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_recruiters.id"), nullable=True)
-    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_name: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="HEALTHY")
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    total_processed: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class RecruitmentSetting(Base, TimestampMixin):
     __tablename__ = "recruitment_settings"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
     company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), unique=True)
-    notify_on_view: Mapped[bool] = mapped_column(Boolean, default=False)
     notify_on_contact: Mapped[bool] = mapped_column(Boolean, default=True)
-    renotify_interval_hours: Mapped[int] = mapped_column(Integer, default=24)
-    allow_company_level_rejection_roles: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["ADMIN", "HR_MANAGER"])
+    catchup_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class PluginDiagnostic(Base):
@@ -294,9 +365,7 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(80))
     entity_type: Mapped[str] = mapped_column(String(80))
     entity_id: Mapped[str] = mapped_column(String(36))
-    before_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     after_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    request_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 

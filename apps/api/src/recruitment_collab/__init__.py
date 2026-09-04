@@ -1,2 +1,1 @@
 """Recruitment collaboration platform."""
-

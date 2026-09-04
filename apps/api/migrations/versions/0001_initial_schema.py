@@ -1,4 +1,5 @@
 """Initial complete recruitment schema."""
+
 from alembic import op
 
 from recruitment_collab.infrastructure import models  # noqa: F401
@@ -16,4 +17,3 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     Base.metadata.drop_all(bind=op.get_bind(), checkfirst=True)
-

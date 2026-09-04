@@ -4,7 +4,7 @@ VENV := .venv
 PY := $(VENV)/bin/python
 PNPM ?= pnpm
 
-.PHONY: bootstrap install dev dev-api dev-web dev-extension dev-mock-site db-up db-down migrate migration seed test test-api test-web test-extension test-e2e lint typecheck build clean-build generate-api-client
+.PHONY: bootstrap install dev dev-api dev-notification-worker dev-candidate-sync-worker dev-data-retention-worker dev-web dev-extension dev-mock-site db-up db-down migrate migration seed test test-api test-web test-extension test-e2e lint typecheck build clean-build generate-api-client boss-cdp
 
 bootstrap: install
 	@echo "Bootstrap complete. Copy .env.example to .env before Docker startup."
@@ -20,6 +20,15 @@ dev:
 dev-api:
 	PYTHONPATH=apps/api/src $(PY) -m uvicorn recruitment_collab.main:app --reload --port 8000
 
+dev-notification-worker:
+	PYTHONPATH=apps/api/src $(PY) -m recruitment_collab.workers.notification_worker
+
+dev-candidate-sync-worker:
+	PYTHONPATH=apps/api/src $(PY) -m recruitment_collab.workers.candidate_sync_worker
+
+dev-data-retention-worker:
+	PYTHONPATH=apps/api/src $(PY) -m recruitment_collab.workers.data_retention_worker
+
 dev-web:
 	$(PNPM) --filter @recruitment/web dev
 
@@ -29,6 +38,9 @@ dev-extension:
 dev-mock-site:
 	$(PNPM) --filter @recruitment/mock-site dev
 
+boss-cdp:
+	$(PYTHON) scripts/boss_cdp_capture.py --keyword "$(KEYWORD)" --city "$(CITY)" --cdp-port "$(or $(CDP_PORT),9222)" --output "$(or $(OUTPUT),./data/boss/jobs.json)"
+
 db-up:
 	docker compose up -d postgres
 
@@ -36,10 +48,10 @@ db-down:
 	docker compose down
 
 migrate:
-	cd apps/api && ../../$(PY) -m alembic upgrade head
+	$(PY) -m alembic -c apps/api/alembic.ini upgrade head
 
 migration:
-	cd apps/api && ../../$(PY) -m alembic revision --autogenerate -m "schema update"
+	$(PY) -m alembic -c apps/api/alembic.ini revision --autogenerate -m "schema update"
 
 seed:
 	PYTHONPATH=apps/api/src $(PY) -m recruitment_collab.infrastructure.seed

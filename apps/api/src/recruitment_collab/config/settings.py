@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import List
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +27,16 @@ class Settings(BaseSettings):
     feishu_encrypt_key: str = ""
     feishu_verification_token: str = ""
     feishu_redirect_uri: str = ""
+    feishu_bitable_app_token: str = ""
+    feishu_bitable_candidate_table_id: str = ""
+    feishu_bitable_followup_table_id: str = ""
+    plugin_company_code: str = ""
+    public_web_url: str = "http://localhost:5173"
+    candidate_cache_days: int = 30
+    diagnostic_retention_days: int = 30
+    event_retention_days: int = 90
+    audit_retention_days: int = 180
+    failed_task_retention_days: int = 30
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -38,6 +48,47 @@ class Settings(BaseSettings):
     @property
     def is_development(self) -> bool:
         return self.app_env in {"development", "test"}
+
+    @model_validator(mode="after")
+    def validate_production_configuration(self) -> "Settings":
+        if self.app_env != "production":
+            return self
+        errors: list[str] = []
+        if len(self.secret_key) < 32 or "development" in self.secret_key or "change-me" in self.secret_key:
+            errors.append("SECRET_KEY 必须是至少 32 字符的非默认随机值")
+        if not self.database_url.startswith(("postgresql://", "postgresql+psycopg://")):
+            errors.append("DATABASE_URL 必须使用 PostgreSQL")
+        if self.feishu_mode != "real":
+            errors.append("FEISHU_MODE 必须为 real")
+        required = {
+            "FEISHU_APP_ID": self.feishu_app_id,
+            "FEISHU_APP_SECRET": self.feishu_app_secret,
+            "FEISHU_REDIRECT_URI": self.feishu_redirect_uri,
+            "FEISHU_BITABLE_APP_TOKEN": self.feishu_bitable_app_token,
+            "FEISHU_BITABLE_CANDIDATE_TABLE_ID": self.feishu_bitable_candidate_table_id,
+            "FEISHU_ENCRYPT_KEY": self.feishu_encrypt_key,
+            "FEISHU_VERIFICATION_TOKEN": self.feishu_verification_token,
+            "PLUGIN_COMPANY_CODE": self.plugin_company_code,
+        }
+        errors.extend(f"{name} 未配置" for name, value in required.items() if not value.strip())
+        if self.feishu_redirect_uri and not self.feishu_redirect_uri.startswith("https://"):
+            errors.append("FEISHU_REDIRECT_URI 必须使用 HTTPS")
+        if self.public_web_url and not self.public_web_url.startswith("https://"):
+            errors.append("PUBLIC_WEB_URL 必须使用 HTTPS")
+        if not self.cors_origins or any(origin == "*" or not origin.startswith("https://") for origin in self.cors_origins):
+            errors.append("CORS_ORIGINS 必须只包含明确的 HTTPS Origin")
+        retention = (
+            self.candidate_cache_days,
+            self.diagnostic_retention_days,
+            self.event_retention_days,
+            self.audit_retention_days,
+            self.failed_task_retention_days,
+        )
+        if any(value <= 0 for value in retention):
+            errors.append("所有数据保留期限必须大于 0")
+        if errors:
+            raise ValueError("生产配置无效：" + "；".join(errors))
+        return self
 
 
 @lru_cache

@@ -1,21 +1,41 @@
 services:
   postgres:
     image: postgres:16-alpine
-    environment: {POSTGRES_DB: recruitment, POSTGRES_USER: recruitment, POSTGRES_PASSWORD: recruitment}
+    environment: {POSTGRES_DB: recruitment, POSTGRES_USER: recruitment, POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-recruitment}"}
     volumes: [recruitment_pg:/var/lib/postgresql/data]
     ports: ["5432:5432"]
     healthcheck: {test: ["CMD-SHELL", "pg_isready -U recruitment"], interval: 5s, timeout: 3s, retries: 20}
+    restart: unless-stopped
   api:
     build: {context: ., dockerfile: apps/api/Dockerfile}
     env_file: [.env]
+    environment: {DATABASE_URL: "postgresql+psycopg://recruitment:${POSTGRES_PASSWORD:-recruitment}@postgres:5432/recruitment"}
+    command: ["sh", "-c", "python -m alembic -c /app/apps/api/alembic.ini upgrade head && exec uvicorn recruitment_collab.main:app --host 0.0.0.0 --port 8000"]
     ports: ["8000:8000"]
     depends_on: {postgres: {condition: service_healthy}}
     healthcheck: {test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"], interval: 10s, timeout: 3s, retries: 10}
+    restart: unless-stopped
   worker:
     build: {context: ., dockerfile: apps/api/Dockerfile}
     command: ["python", "-m", "recruitment_collab.workers.notification_worker"]
     env_file: [.env]
-    depends_on: {postgres: {condition: service_healthy}}
+    environment: {DATABASE_URL: "postgresql+psycopg://recruitment:${POSTGRES_PASSWORD:-recruitment}@postgres:5432/recruitment"}
+    depends_on: {api: {condition: service_healthy}}
+    restart: unless-stopped
+  candidate-sync-worker:
+    build: {context: ., dockerfile: apps/api/Dockerfile}
+    command: ["python", "-m", "recruitment_collab.workers.candidate_sync_worker"]
+    env_file: [.env]
+    environment: {DATABASE_URL: "postgresql+psycopg://recruitment:${POSTGRES_PASSWORD:-recruitment}@postgres:5432/recruitment"}
+    depends_on: {api: {condition: service_healthy}}
+    restart: unless-stopped
+  data-retention-worker:
+    build: {context: ., dockerfile: apps/api/Dockerfile}
+    command: ["python", "-m", "recruitment_collab.workers.data_retention_worker"]
+    env_file: [.env]
+    environment: {DATABASE_URL: "postgresql+psycopg://recruitment:${POSTGRES_PASSWORD:-recruitment}@postgres:5432/recruitment"}
+    depends_on: {api: {condition: service_healthy}}
+    restart: unless-stopped
   web:
     build: {context: ., dockerfile: infra/docker/web.Dockerfile}
     ports: ["5173:80"]
@@ -24,4 +44,3 @@ services:
     build: {context: ., dockerfile: infra/docker/mock-site.Dockerfile}
     ports: ["5174:80"]
 volumes: {recruitment_pg: {}}
-

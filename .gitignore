@@ -14,6 +14,7 @@ apps/mock-recruitment-site/src/*.js
 node_modules/
 dist/
 coverage/
+.coverage
 playwright-report/
 test-results/
 .DS_Store

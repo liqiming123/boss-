@@ -7,3 +7,6 @@ onlyBuiltDependencies:
   - esbuild
 allowBuilds:
   esbuild: true
+peerDependencyRules:
+  allowedVersions:
+    unplugin: "2"

@@ -89,6 +89,46 @@
         }
       }
     },
+    "/api/v1/auth/login": {
+      "post": {
+        "summary": "Admin Login",
+        "operationId": "admin_login_api_v1_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DevLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Admin Login Api V1 Auth Login Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/auth/refresh": {
       "post": {
         "summary": "Refresh",
@@ -179,50 +219,6 @@
         }
       }
     },
-    "/api/v1/plugin/me": {
-      "get": {
-        "summary": "Me",
-        "operationId": "me_api_v1_plugin_me_get",
-        "parameters": [
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "title": "Response Me Api V1 Plugin Me Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/auth/me": {
       "get": {
         "summary": "Me",
@@ -267,145 +263,21 @@
         }
       }
     },
-    "/api/v1/auth/device/start": {
+    "/api/v1/auth/feishu/web/start": {
       "post": {
-        "summary": "Device Start",
-        "operationId": "device_start_api_v1_auth_device_start_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "additionalProperties": {
-                  "type": "string"
-                },
-                "type": "object",
-                "title": "Body"
-              }
-            }
-          },
-          "required": true
-        },
+        "summary": "Feishu Web Login Start",
+        "operationId": "feishu_web_login_start_api_v1_auth_feishu_web_start_post",
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Device Start Api V1 Auth Device Start Post"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/auth/device/poll": {
-      "post": {
-        "summary": "Device Poll",
-        "operationId": "device_poll_api_v1_auth_device_poll_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "additionalProperties": {
-                  "type": "string"
-                },
-                "type": "object",
-                "title": "Body"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Device Poll Api V1 Auth Device Poll Post"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/auth/device/approve": {
-      "post": {
-        "summary": "Device Approve",
-        "operationId": "device_approve_api_v1_auth_device_approve_post",
-        "parameters": [
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "additionalProperties": {
-                  "type": "string"
-                },
-                "title": "Body"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
                   "additionalProperties": {
-                    "type": "boolean"
+                    "type": "string"
                   },
-                  "title": "Response Device Approve Api V1 Auth Device Approve Post"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "type": "object",
+                  "title": "Response Feishu Web Login Start Api V1 Auth Feishu Web Start Post"
                 }
               }
             }
@@ -466,21 +338,92 @@
         }
       }
     },
-    "/api/v1/auth/feishu/login": {
+    "/api/v1/plugin/feishu-binding/status": {
       "get": {
-        "summary": "Feishu Login",
-        "operationId": "feishu_login_api_v1_auth_feishu_login_get",
+        "summary": "Feishu Binding Status",
+        "operationId": "feishu_binding_status_api_v1_plugin_feishu_binding_status_get",
+        "parameters": [
+          {
+            "name": "account_display_name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "title": "Account Display Name"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
                   "type": "object",
-                  "title": "Response Feishu Login Api V1 Auth Feishu Login Get"
+                  "additionalProperties": true,
+                  "title": "Response Feishu Binding Status Api V1 Plugin Feishu Binding Status Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugin/feishu-binding/start": {
+      "post": {
+        "summary": "Feishu Binding Start",
+        "operationId": "feishu_binding_start_api_v1_plugin_feishu_binding_start_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeishuBindingStartRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Feishu Binding Start Api V1 Plugin Feishu Binding Start Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -501,19 +444,24 @@
               "type": "string",
               "title": "Code"
             }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "State"
+            }
           }
         ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
-              "application/json": {
+              "text/html": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "title": "Response Feishu Callback Api V1 Auth Feishu Callback Get"
+                  "type": "string"
                 }
               }
             }
@@ -531,10 +479,50 @@
         }
       }
     },
-    "/api/v1/plugin/context/resolve": {
+    "/api/v1/auth/feishu/device/poll": {
       "post": {
-        "summary": "Resolve Context",
-        "operationId": "resolve_context_api_v1_plugin_context_resolve_post",
+        "summary": "Feishu Device Poll",
+        "operationId": "feishu_device_poll_api_v1_auth_feishu_device_poll_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeishuDevicePollRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Feishu Device Poll Api V1 Auth Feishu Device Poll Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugin/context/check": {
+      "post": {
+        "summary": "Check Context",
+        "operationId": "check_context_api_v1_plugin_context_check_post",
         "parameters": [
           {
             "name": "authorization",
@@ -565,7 +553,7 @@
                 "schema": {
                   "type": "object",
                   "additionalProperties": true,
-                  "title": "Response Resolve Context Api V1 Plugin Context Resolve Post"
+                  "title": "Response Check Context Api V1 Plugin Context Check Post"
                 }
               }
             }
@@ -583,10 +571,10 @@
         }
       }
     },
-    "/api/v1/plugin/engagements/claim": {
+    "/api/v1/plugin/engagements/message-sent": {
       "post": {
-        "summary": "Claim",
-        "operationId": "claim_api_v1_plugin_engagements_claim_post",
+        "summary": "Message Sent",
+        "operationId": "message_sent_api_v1_plugin_engagements_message_sent_post",
         "parameters": [
           {
             "name": "authorization",
@@ -604,7 +592,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/EventRequest"
+                "$ref": "#/components/schemas/MessageSentRequest"
               }
             }
           }
@@ -617,7 +605,346 @@
                 "schema": {
                   "type": "object",
                   "additionalProperties": true,
-                  "title": "Response Claim Api V1 Plugin Engagements Claim Post"
+                  "title": "Response Message Sent Api V1 Plugin Engagements Message Sent Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugin/conversations/sync": {
+      "post": {
+        "summary": "Sync Conversation",
+        "operationId": "sync_conversation_api_v1_plugin_conversations_sync_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationSyncRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Sync Conversation Api V1 Plugin Conversations Sync Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugin/conversations/checkpoint": {
+      "get": {
+        "summary": "Get Scan Checkpoint",
+        "operationId": "get_scan_checkpoint_api_v1_plugin_conversations_checkpoint_get",
+        "parameters": [
+          {
+            "name": "account_display_name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "title": "Account Display Name"
+            }
+          },
+          {
+            "name": "platform",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "boss",
+              "title": "Platform"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Scan Checkpoint Api V1 Plugin Conversations Checkpoint Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Put Scan Checkpoint",
+        "operationId": "put_scan_checkpoint_api_v1_plugin_conversations_checkpoint_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScanCheckpointRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Put Scan Checkpoint Api V1 Plugin Conversations Checkpoint Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugin/conversations/{source_id}/snapshot": {
+      "post": {
+        "summary": "Upload Conversation Snapshot",
+        "operationId": "upload_conversation_snapshot_api_v1_plugin_conversations__source_id__snapshot_post",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_conversation_snapshot_api_v1_plugin_conversations__source_id__snapshot_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Upload Conversation Snapshot Api V1 Plugin Conversations  Source Id  Snapshot Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugin/conversations/snapshot-status": {
+      "put": {
+        "summary": "Update Conversation Snapshot Status",
+        "operationId": "update_conversation_snapshot_status_api_v1_plugin_conversations_snapshot_status_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SnapshotStatusRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Update Conversation Snapshot Status Api V1 Plugin Conversations Snapshot Status Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugin/conversations/{source_id}/resume": {
+      "post": {
+        "summary": "Upload Candidate Resume",
+        "operationId": "upload_candidate_resume_api_v1_plugin_conversations__source_id__resume_post",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_candidate_resume_api_v1_plugin_conversations__source_id__resume_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Upload Candidate Resume Api V1 Plugin Conversations  Source Id  Resume Post"
                 }
               }
             }
@@ -847,51 +1174,6 @@
         }
       }
     },
-    "/api/v1/admin/conflicts": {
-      "get": {
-        "summary": "Conflicts",
-        "operationId": "conflicts_api_v1_admin_conflicts_get",
-        "parameters": [
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "additionalProperties": true
-                  },
-                  "title": "Response Conflicts Api V1 Admin Conflicts Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/conflicts": {
       "get": {
         "summary": "Conflicts",
@@ -920,57 +1202,6 @@
                     "additionalProperties": true
                   },
                   "title": "Response Conflicts Api V1 Conflicts Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/admin/conflicts/{conflict_id}": {
-      "get": {
-        "summary": "Conflict Detail",
-        "operationId": "conflict_detail_api_v1_admin_conflicts__conflict_id__get",
-        "parameters": [
-          {
-            "name": "conflict_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Conflict Id"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Conflict Detail Api V1 Admin Conflicts  Conflict Id  Get"
                 }
               }
             }
@@ -1201,6 +1432,154 @@
                     "type": "integer"
                   },
                   "title": "Response Overview Api V1 Admin Overview Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/operations": {
+      "get": {
+        "summary": "Operations",
+        "operationId": "operations_api_v1_admin_operations_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Operations Api V1 Admin Operations Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/devices/{device_id}/revoke": {
+      "post": {
+        "summary": "Admin Revoke Device",
+        "operationId": "admin_revoke_device_api_v1_admin_devices__device_id__revoke_post",
+        "parameters": [
+          {
+            "name": "device_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Device Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Admin Revoke Device Api V1 Admin Devices  Device Id  Revoke Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/candidate-sync/{outbox_id}/retry": {
+      "post": {
+        "summary": "Admin Retry Candidate Sync",
+        "operationId": "admin_retry_candidate_sync_api_v1_admin_candidate_sync__outbox_id__retry_post",
+        "parameters": [
+          {
+            "name": "outbox_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Outbox Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Admin Retry Candidate Sync Api V1 Admin Candidate Sync  Outbox Id  Retry Post"
                 }
               }
             }
@@ -1764,9 +2143,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "additionalProperties": true,
-                "title": "Body"
+                "$ref": "#/components/schemas/RecruitmentSettingsUpdate"
               }
             }
           }
@@ -1999,6 +2376,57 @@
         ],
         "title": "AliasCreate"
       },
+      "Body_upload_candidate_resume_api_v1_plugin_conversations__source_id__resume_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "format": "binary",
+            "title": "File"
+          },
+          "resume_hash": {
+            "type": "string",
+            "title": "Resume Hash"
+          },
+          "related_source_ids": {
+            "type": "string",
+            "title": "Related Source Ids",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "file",
+          "resume_hash"
+        ],
+        "title": "Body_upload_candidate_resume_api_v1_plugin_conversations__source_id__resume_post"
+      },
+      "Body_upload_conversation_snapshot_api_v1_plugin_conversations__source_id__snapshot_post": {
+        "properties": {
+          "files": {
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "type": "array",
+            "title": "Files"
+          },
+          "snapshot_hash": {
+            "type": "string",
+            "title": "Snapshot Hash"
+          },
+          "related_source_ids": {
+            "type": "string",
+            "title": "Related Source Ids",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "files",
+          "snapshot_hash"
+        ],
+        "title": "Body_upload_conversation_snapshot_api_v1_plugin_conversations__source_id__snapshot_post"
+      },
       "ContextResolveRequest": {
         "properties": {
           "platform": {
@@ -2036,6 +2464,43 @@
             "minLength": 1,
             "title": "Candidate Display Name"
           },
+          "candidate_age": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100.0,
+                "minimum": 16.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Age"
+          },
+          "candidate_experience": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 40
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Experience"
+          },
+          "candidate_education": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 40
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Education"
+          },
           "job_display_name": {
             "type": "string",
             "maxLength": 120,
@@ -2043,10 +2508,49 @@
             "title": "Job Display Name"
           },
           "account_display_name": {
-            "type": "string",
-            "maxLength": 100,
-            "minLength": 1,
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Account Display Name"
+          },
+          "conversation_started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Started At"
+          },
+          "conversation_updated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Updated At"
+          },
+          "native_communications": {
+            "items": {
+              "$ref": "#/components/schemas/NativeCommunicationRecord"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "title": "Native Communications"
           },
           "observed_at": {
             "type": "string",
@@ -2072,12 +2576,219 @@
           "page_url",
           "candidate_display_name",
           "job_display_name",
-          "account_display_name",
           "observed_at",
           "client_event_id",
           "extractor_version"
         ],
         "title": "ContextResolveRequest"
+      },
+      "ConversationSyncRequest": {
+        "properties": {
+          "platform": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]{2,30}$",
+            "title": "Platform"
+          },
+          "page_url": {
+            "type": "string",
+            "maxLength": 2083,
+            "minLength": 1,
+            "format": "uri",
+            "title": "Page Url"
+          },
+          "platform_candidate_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Platform Candidate Id"
+          },
+          "platform_id_scope": {
+            "type": "string",
+            "title": "Platform Id Scope",
+            "default": "UNKNOWN"
+          },
+          "candidate_display_name": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Candidate Display Name"
+          },
+          "candidate_age": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100.0,
+                "minimum": 16.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Age"
+          },
+          "candidate_experience": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 40
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Experience"
+          },
+          "candidate_education": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 40
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Education"
+          },
+          "job_display_name": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Job Display Name"
+          },
+          "account_display_name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Display Name"
+          },
+          "conversation_started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Started At"
+          },
+          "conversation_updated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Updated At"
+          },
+          "native_communications": {
+            "items": {
+              "$ref": "#/components/schemas/NativeCommunicationRecord"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "title": "Native Communications"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Observed At"
+          },
+          "client_event_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 8,
+            "title": "Client Event Id"
+          },
+          "extractor_version": {
+            "type": "string",
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Extractor Version"
+          },
+          "sent_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Sent At"
+          },
+          "recruitment_status": {
+            "type": "string",
+            "maxLength": 30,
+            "title": "Recruitment Status",
+            "default": "沟通中"
+          },
+          "status_evidence": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Evidence"
+          },
+          "status_rule_version": {
+            "type": "string",
+            "maxLength": 20,
+            "title": "Status Rule Version",
+            "default": "boss-status-v1"
+          },
+          "resume_status": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 30
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resume Status"
+          },
+          "has_recruiter_outbound": {
+            "type": "boolean",
+            "title": "Has Recruiter Outbound"
+          },
+          "sync_reason": {
+            "type": "string",
+            "pattern": "^(MESSAGE_SENT|CATCHUP|CONVERSATION_UPDATED)$",
+            "title": "Sync Reason",
+            "default": "CATCHUP"
+          }
+        },
+        "type": "object",
+        "required": [
+          "platform",
+          "page_url",
+          "candidate_display_name",
+          "job_display_name",
+          "observed_at",
+          "client_event_id",
+          "extractor_version",
+          "sent_at",
+          "has_recruiter_outbound"
+        ],
+        "title": "ConversationSyncRequest"
       },
       "DevLoginRequest": {
         "properties": {
@@ -2135,14 +2846,12 @@
               "type": "string"
             },
             "type": "array",
-            "title": "Error Codes",
-            "default": []
+            "title": "Error Codes"
           },
           "sanitized_context": {
             "additionalProperties": true,
             "type": "object",
-            "title": "Sanitized Context",
-            "default": {}
+            "title": "Sanitized Context"
           }
         },
         "type": "object",
@@ -2193,6 +2902,74 @@
           "idempotency_key"
         ],
         "title": "EventRequest"
+      },
+      "FeishuBindingStartRequest": {
+        "properties": {
+          "account_display_name": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Account Display Name"
+          },
+          "action": {
+            "type": "string",
+            "pattern": "^(bind|unbind)$",
+            "title": "Action"
+          },
+          "device_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 8
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Id"
+          },
+          "device_name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_display_name",
+          "action"
+        ],
+        "title": "FeishuBindingStartRequest"
+      },
+      "FeishuDevicePollRequest": {
+        "properties": {
+          "attempt_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 8,
+            "title": "Attempt Id"
+          },
+          "poll_token": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 20,
+            "title": "Poll Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "attempt_id",
+          "poll_token"
+        ],
+        "title": "FeishuDevicePollRequest"
       },
       "HTTPValidationError": {
         "properties": {
@@ -2296,6 +3073,237 @@
         ],
         "title": "JobCreate"
       },
+      "MessageSentRequest": {
+        "properties": {
+          "platform": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]{2,30}$",
+            "title": "Platform"
+          },
+          "page_url": {
+            "type": "string",
+            "maxLength": 2083,
+            "minLength": 1,
+            "format": "uri",
+            "title": "Page Url"
+          },
+          "platform_candidate_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Platform Candidate Id"
+          },
+          "platform_id_scope": {
+            "type": "string",
+            "title": "Platform Id Scope",
+            "default": "UNKNOWN"
+          },
+          "candidate_display_name": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Candidate Display Name"
+          },
+          "candidate_age": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100.0,
+                "minimum": 16.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Age"
+          },
+          "candidate_experience": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 40
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Experience"
+          },
+          "candidate_education": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 40
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Education"
+          },
+          "job_display_name": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Job Display Name"
+          },
+          "account_display_name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Display Name"
+          },
+          "conversation_started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Started At"
+          },
+          "conversation_updated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Updated At"
+          },
+          "native_communications": {
+            "items": {
+              "$ref": "#/components/schemas/NativeCommunicationRecord"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "title": "Native Communications"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Observed At"
+          },
+          "client_event_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 8,
+            "title": "Client Event Id"
+          },
+          "extractor_version": {
+            "type": "string",
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Extractor Version"
+          },
+          "sent_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Sent At"
+          },
+          "recruitment_status": {
+            "type": "string",
+            "maxLength": 30,
+            "title": "Recruitment Status",
+            "default": "沟通中"
+          },
+          "status_evidence": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Evidence"
+          },
+          "status_rule_version": {
+            "type": "string",
+            "maxLength": 20,
+            "title": "Status Rule Version",
+            "default": "boss-status-v1"
+          },
+          "resume_status": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 30
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resume Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "platform",
+          "page_url",
+          "candidate_display_name",
+          "job_display_name",
+          "observed_at",
+          "client_event_id",
+          "extractor_version",
+          "sent_at"
+        ],
+        "title": "MessageSentRequest"
+      },
+      "NativeCommunicationRecord": {
+        "properties": {
+          "recruiter_name": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Recruiter Name"
+          },
+          "job_name": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Job Name"
+          },
+          "contacted_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Contacted At"
+          },
+          "source": {
+            "type": "string",
+            "pattern": "^BOSS_NATIVE$",
+            "title": "Source",
+            "default": "BOSS_NATIVE"
+          }
+        },
+        "type": "object",
+        "required": [
+          "recruiter_name",
+          "job_name",
+          "contacted_at"
+        ],
+        "title": "NativeCommunicationRecord"
+      },
       "ReasonRequest": {
         "properties": {
           "reason": {
@@ -2340,6 +3348,89 @@
           "password"
         ],
         "title": "RecruiterCreate"
+      },
+      "RecruitmentSettingsUpdate": {
+        "properties": {
+          "notify_on_contact": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notify On Contact"
+          }
+        },
+        "type": "object",
+        "title": "RecruitmentSettingsUpdate"
+      },
+      "ScanCheckpointRequest": {
+        "properties": {
+          "platform": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]{2,30}$",
+            "title": "Platform",
+            "default": "boss"
+          },
+          "account_display_name": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Account Display Name"
+          },
+          "completed_through_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Completed Through At"
+          },
+          "cursor": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Cursor"
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_display_name",
+          "completed_through_at"
+        ],
+        "title": "ScanCheckpointRequest"
+      },
+      "SnapshotStatusRequest": {
+        "properties": {
+          "candidate_source_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Candidate Source Ids"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "FAILED",
+              "INTERRUPTED"
+            ],
+            "title": "Status"
+          },
+          "error_code": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Error Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "candidate_source_ids",
+          "status",
+          "error_code"
+        ],
+        "title": "SnapshotStatusRequest"
       },
       "ValidationError": {
         "properties": {
