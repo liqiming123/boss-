@@ -7,6 +7,8 @@ export type ContextMatch = {
   job_name?: string;
   stage: string;
   updated_at?: string | number | null;
+  first_contact_at?: string | null;
+  last_activity_at?: string | null;
   match_reason: string;
   evidence_source?: string;
   feishu_synced?: boolean;

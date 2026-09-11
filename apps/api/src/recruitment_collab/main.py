@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 
+from recruitment_collab.api.company_daily_routes import router as company_daily_router
 from recruitment_collab.api.routes import router
 from recruitment_collab.application.collaboration import ApplicationError
 from recruitment_collab.config.settings import get_settings
@@ -18,7 +19,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 if not settings.is_development:
@@ -55,3 +56,4 @@ async def application_error(request: Request, exc: ApplicationError):
 
 
 app.include_router(router)
+app.include_router(company_daily_router)

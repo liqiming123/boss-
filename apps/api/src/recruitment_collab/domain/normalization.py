@@ -39,6 +39,9 @@ EDUCATION_ALIASES = {
 
 def normalize_experience(value: str) -> str:
     normalized = _normalize(value).replace("工作经验", "").strip()
+    cohort = re.fullmatch(r"(\d{2})\s*届", normalized)
+    if cohort:
+        return f"{int(cohort.group(1)):02d}届"
     if normalized in {"应届生", "应届", "在校生"}:
         return "应届生"
     if normalized in {"无经验", "经验不限", "不限"}:

@@ -13,8 +13,13 @@ tests/*.js
 apps/mock-recruitment-site/src/*.js
 node_modules/
 dist/
+build/
+apps/api/build/
 coverage/
 .coverage
 playwright-report/
 test-results/
 .DS_Store
+backups/
+data/
+*.log

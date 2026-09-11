@@ -16,11 +16,14 @@ import { normalizeBossText } from "./boss-normalizers";
 import { parseBossConversationTimes } from "./boss-times";
 import {
   bossHistoricalJobs,
+  classifyBossOutgoingMessage,
   classifyBossStatus,
 } from "./boss-status";
 import { collectBossNativeCommunicationHistory } from "./boss-native-history";
 import { isBossHostname } from "./boss-hosts";
-import { findBossConversationRegion, summarizeBossConversation } from "./boss-chat";
+import { bossOutgoingBubbleText, findBossConversationRegion, summarizeBossConversation } from "./boss-chat";
+import { openBossCommunicationHistory } from "./boss-chat";
+import { delay } from "../../shared/delay";
 const unavailable = <T>(code = "BOSS_FIELDS_NOT_FOUND"): Extraction<T> => ({
   status: "ERROR",
   errorCode: code,
@@ -32,27 +35,98 @@ const pageText = () =>
         /\u00a0/g,
         " ",
       );
-const chatPage = () =>
-  /\/web\/chat\/index(?:$|[?#])/.test(location.pathname + location.search);
+// The communication list is also rendered on BOSS's intention/interaction
+// views. Those pages have no active candidate detail, but they are valid
+// scan surfaces for the account-level background catch-up.
+const chatShellPage = () =>
+  /\/web\/chat\/(?:index|interaction|intention)(?:$|[?#])/.test(
+    location.pathname + location.search,
+  );
+const candidateDetailPage = () => {
+  const text = pageText();
+  // Age is optional on some BOSS profiles and may arrive after the rest of
+  // the profile card. Do not reject an otherwise valid detail page merely
+  // because that one field is hidden or still loading.
+  return chatShellPage() && /沟通(?:的)?职位/.test(text);
+};
 const lines = (text: string) =>
   text
     .replace(/\u00a0/g, " ")
     .split(/\n+/)
     .map((v) => normalizeBossText(v))
     .filter(Boolean);
+// BOSS mixes list controls into the same text flow as the profile card. The
+// virtualized conversation list ends with a load-more control, and BOSS can
+// render that control immediately above the profile line, so a placeholder
+// must never be accepted as a candidate identity. A row synced as
+// "滚动加载更多" is not a person and permanently pollutes the Feishu table.
+const BOSS_UI_TEXT =
+  /^(?:滚动加载更多|点击加载更多|加载更多|查看更多|展开更多|收起|展开|没有更多了?|暂无更多|暂无数据|没有相关数据|暂无信息|加载中|正在加载|请稍候|未登录|请先登录|立即登录|刷新|换一换|下载APP|使用说明|意见反馈|帮助中心|回到顶部|全部职位|知道了|我知道了|确定|取消)$/;
+const isBossUiText = (value: string) =>
+  BOSS_UI_TEXT.test(value) || /加载更多|查看更多|暂无数据|没有更多|暂无更多/.test(value);
 const isName = (value: string) =>
   /^[\u4e00-\u9fff·]{2,20}$/.test(value.replace(/[ \t]+(?=[\u4e00-\u9fff·])/g, "")) &&
+  !isBossUiText(value.replace(/[ \t]+/g, "")) &&
   !/(职位|沟通|简历|本科|硕士|大专|活跃|昨天|今天|刚刚|全部|未读)/.test(value.replace(/[ \t]+/g, ""));
 const canonicalName = (value: string) =>
   value.replace(/[ \t]+(?=[\u4e00-\u9fff·])/g, "");
+// `26届` and `26年毕业` are graduation cohorts, not years of experience. The
+// generic `N年` pattern used to read the graduation year as work experience,
+// producing impossible profiles such as a 24-year-old with "26年" experience
+// and a 20-year-old with "27年". Graduation phrases are removed before the
+// experience pattern runs, and a graduation-only profile reports the cohort.
+const graduationText = /(\d{2,4})\s*年\s*(?:毕业生|毕业时间|毕业|应届生|应届)/g;
+const cohortText = /(\d{2,4})\s*届(?:毕业生|生)?/g;
+const cohortLabel = (value: string) =>
+  `${String(Number(value) % 100).padStart(2, "0")}届`;
+function parseExperience(value: string): string | undefined {
+  const graduation = value.match(/(\d{2,4})\s*年\s*(?:毕业生|毕业时间|毕业|应届生|应届)/);
+  const cohort = value.match(/(\d{2,4})\s*届(?:毕业生|生)?/);
+  const scrubbed = value.replace(graduationText, " ").replace(cohortText, " ");
+  // A bare `N年` must not be a calendar year: a 4-digit year (`2026年`) or a
+  // date fragment (`2026年09月`) is never years of experience.
+  const explicit = scrubbed.match(
+    /(?:工作经验\s*[:：]?\s*)?(\d+\s*[-至~]\s*\d+\s*年(?:以上)?|\d+\s*年以上|应届生|应届|在校生|无经验|经验不限|(?<!\d)\d{1,2}\s*年(?!\s*[\d.]*\s*[月日]))/,
+  );
+  if (explicit?.[1])
+    return explicit[1].replace(/\s*[-至~]\s*/g, "-").replace(/\s+/g, "");
+  const year = graduation?.[1] ?? cohort?.[1];
+  return year ? cohortLabel(year) : undefined;
+}
+// BOSS sometimes renders the candidate's profile tail or the first chat line in
+// the same text run as the job label (`财务主管 最近关注：无锡`,
+// `直播助播 您好,我想和您沟通下…`). Neither belongs to the job name, so cut at
+// the first conversational marker. NFKC has already turned full-width
+// punctuation into ASCII by this point, hence both forms in the classes.
+const JOB_TRAILING_LABEL =
+  /\s*(?:最近关注|最近登录|最近沟通|求职意向|期望|薪资|工作地点|到岗时间)\s*[：:][\s\S]*$/;
+const JOB_TRAILING_PLAIN = /\s*(?:最近关注|最近登录|已读|未读|送达)\s*[\s\S]*$/;
+const JOB_CHAT_TAIL =
+  /[，,。；;！!？?][\s\S]*$|\s+(?:您好|你好|请问|期待|方便|我们|目前|我是|有意向|在吗|看到)[\s\S]*$/;
+const JOB_PROFILE_TAIL = /\s+[\u4e00-\u9fff·]{2,20}\s+\d{1,2}\s*岁[\s\S]*$/;
+function cleanJobName(value: string) {
+  return value
+    .replace(JOB_TRAILING_LABEL, "")
+    .replace(JOB_TRAILING_PLAIN, "")
+    .replace(JOB_CHAT_TAIL, "")
+    .replace(JOB_PROFILE_TAIL, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 function candidateName(text: string) {
   const values = lines(text);
+  const isUiLine = (value: string) => isBossUiText(value.replace(/[ \t]+/g, ""));
   for (let i = 0; i < values.length; i++) {
     if (!/^\d{1,2}\s*岁$/.test(values[i])) continue;
     const nearby = values.slice(i + 1, i + 5).join(" ");
     if (!/(本科|硕士|大专|博士)/.test(nearby)) continue;
-    for (let j = i - 1; j >= Math.max(0, i - 4); j--)
+    for (let j = i - 1; j >= Math.max(0, i - 4); j--) {
+      // A control immediately above the profile line means this age belongs to
+      // a list/section boundary, not to the candidate being opened. Stop
+      // instead of walking further back into unrelated account text.
+      if (isUiLine(values[j])) break;
       if (isName(values[j])) return canonicalName(values[j]);
+    }
   }
   const compact = normalizeBossText(text).match(
     /([\u4e00-\u9fff·]{2,20})\s+(?:刚刚活跃|在线|昨天|今天)?\s*\d{1,2}\s*岁[\s\S]{0,30}(?:本科|硕士|大专|博士)/,
@@ -65,25 +139,26 @@ function candidateName(text: string) {
   ].filter((match) => isName(match[1]));
   return profileMatches.at(-1)?.[1]
     ? canonicalName(profileMatches.at(-1)![1])
-    : "";
+    : (() => {
+        const values = lines(text);
+        for (let i = 0; i < values.length; i++) {
+          if (!/(\d{2}\s*届|应届生|无经验|经验不限|工作经验|\d+\s*年|中专|高中|中技|技校|大专|专科|本科|学士|硕士|MBA|博士|学历不限)/i.test(values[i])) continue;
+          for (let j = i - 1; j >= Math.max(0, i - 4); j--) {
+            if (isUiLine(values[j])) break;
+            if (isName(values[j])) return canonicalName(values[j]);
+          }
+        }
+        return "";
+      })();
 }
 function jobName(text: string) {
   const normalized = normalizeBossText(text);
   const labeled = normalized.match(/沟通职位\s*[：:]\s*([^\n|]{1,120})/);
-  if (labeled?.[1])
-    return labeled[1]
-      .replace(/\s*(?:期望|薪资)[:：].*$/, "")
-      .replace(/\s+[\u4e00-\u9fff·]{2,20}\s+\d{1,2}\s*岁[\s\S]*$/, "")
-      .trim();
+  if (labeled?.[1]) return cleanJobName(labeled[1]);
   const fallback = normalized.match(
     /沟通(?:的)?职位\s*[-—：:]\s*([^\n|]{1,100})/,
   );
-  return (
-    fallback?.[1]
-      ?.replace(/\s*(?:期望|薪资)[:：].*$/, "")
-      .replace(/\s+[\u4e00-\u9fff·]{2,20}\s+\d{1,2}\s*岁[\s\S]*$/, "")
-      .trim() || ""
-  );
+  return fallback?.[1] ? cleanJobName(fallback[1]) : "";
 }
 function accountName(text: string) {
   const values = lines(text);
@@ -158,18 +233,26 @@ function accountName(text: string) {
 }
 function profile(text: string, name: string) {
   const normalized = normalizeBossText(text);
-  const index = normalized.lastIndexOf(name);
-  const nearby = index >= 0 ? normalized.slice(index, index + 240) : normalized;
-  const age = nearby.match(/(\d{1,2})\s*岁/);
-  const experience = nearby.match(
-    /(?:^|\s)(应届生|无经验|经验不限|\d{1,2}\s*年)(?:\s|$)/,
-  );
+  // The same name appears in the conversation list and message history.
+  // Choose the occurrence with the strongest nearby profile evidence instead
+  // of taking the last occurrence in the whole document.
+  const occurrences = [...normalized.matchAll(new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))];
+  const windows = occurrences.map((match) => normalized.slice(Math.max(0, (match.index || 0) - 40), (match.index || 0) + 360));
+  const nearby = windows
+    .sort((a, b) => {
+      const score = (value: string) =>
+        (/(\d{1,3})\s*岁/.test(value) ? 4 : 0) +
+        (parseExperience(value) !== undefined ? 3 : 0) +
+        (/(中专|高中|中技|技校|大专|专科|本科|学士|硕士|MBA|博士)/i.test(value) ? 3 : 0);
+      return score(b) - score(a);
+    })[0] || normalized;
+  const age = nearby.match(/(\d{1,3})\s*岁/);
   const education = nearby.match(
-    /(?:中专|高中|大专|专科|本科|学士|硕士|MBA|博士)/i,
+    /(中专|高中|中技|技校|大专|专科|本科|学士|硕士|MBA|博士|学历不限)/i,
   );
   return {
     age: age ? Number(age[1]) : undefined,
-    experience: experience?.[1]?.replace(/\s/g, ""),
+    experience: parseExperience(nearby),
     education: education?.[0],
   };
 }
@@ -213,49 +296,99 @@ export class BossAdapter implements RecruitmentSiteAdapter {
     }
   }
   isCandidateConversationPage() {
-    return chatPage();
+    return candidateDetailPage();
   }
   async extractAccount(): Promise<Extraction<AccountData>> {
-    if (!chatPage()) return unavailable("BOSS_UNSUPPORTED_PAGE");
+    if (!chatShellPage()) return unavailable("BOSS_UNSUPPORTED_PAGE");
     const value = accountName(pageText());
     return value
       ? { status: "OK", value: { displayName: value } }
       : unavailable();
   }
   async extractCandidate(): Promise<Extraction<CandidateData>> {
-    if (!chatPage()) return unavailable("BOSS_UNSUPPORTED_PAGE");
-    const text = pageText(),
+    if (!candidateDetailPage()) return unavailable("BOSS_UNSUPPORTED_PAGE");
+    let text = pageText();
+    // The BOSS communication drawer is collapsed by default on several
+    // account/page variants. Open it automatically before extracting history;
+    // recruiters should never have to click the native icon for deduplication.
+    if (!/(?:我的沟通|同事沟通)/.test(text) && /沟通记录/.test(text)) {
+      if (openBossCommunicationHistory()) {
+        await delay(500);
+        text = pageText();
+      }
+    }
+    // Profile fields are loaded independently from the chat shell. Retry a
+    // bounded number of times so slow/virtualized layouts get a stable card,
+    // without keeping the page observer alive indefinitely.
+    let value = candidateName(text);
+    for (let attempt = 0; attempt < 8 && !value; attempt++) {
+      await delay(250);
+      text = pageText();
       value = candidateName(text);
+    }
     if (!value) return unavailable();
+    // Fail closed when the parser only sees a generic shell/profile fragment.
+    // A candidate must have a bounded, human-readable name and a nearby
+    // profile signal; otherwise a recruiter/account name can be persisted as
+    // a candidate during asynchronous BOSS re-renders.
+    if (
+      value.length > 20 ||
+      isBossUiText(value) ||
+      /职位|沟通|简历|招聘|账号/.test(value)
+    ) {
+      return unavailable("BOSS_CANDIDATE_IDENTITY_UNCERTAIN");
+    }
     const details = profile(text, value);
     const times = parseBossConversationTimes(text, value);
     const chat = summarizeBossConversation(text, times.conversationUpdatedAt);
+    const outgoingText = bossOutgoingBubbleText();
+    const nativeCommunications = collectBossNativeCommunicationHistory();
+    const currentAccount = accountName(text);
+    const nativeRecruiterOutbound = nativeCommunications.some(
+      (item) => normalizeBossText(item.recruiterName) === normalizeBossText(currentAccount),
+    );
+    const passiveStatus = classifyBossStatus(
+      chat.evidenceText,
+      new Date().toISOString(),
+      false,
+    );
+    const outgoingStatus = outgoingText
+      ? classifyBossOutgoingMessage(outgoingText)
+      : null;
+    // Prefer an explicit rejection found in either representation. Mobile
+    // messages may render in the chat text before the colored recruiter-bubble
+    // detector catches up; conversely, some layouts omit delivery labels.
+    const statusEvidence =
+      outgoingStatus?.status === "已拒绝"
+        ? outgoingStatus
+        : passiveStatus.status === "已拒绝"
+          ? passiveStatus
+          : outgoingStatus || passiveStatus;
     return {
       status: "OK",
       value: {
         displayName: value,
         ...details,
         ...times,
-        hasRecruiterOutbound: chat.hasRecruiterOutbound,
+        hasRecruiterOutbound: chat.hasRecruiterOutbound || nativeRecruiterOutbound,
         // Candidate profile/resume text may contain interview wishes. Those
         // are not a recruiter-side status transition.
-        statusEvidence: classifyBossStatus(
-          chat.evidenceText,
-          new Date().toISOString(),
-          false,
-        ),
+        statusEvidence,
         historicalJobs: bossHistoricalJobs(text),
-        nativeCommunications: collectBossNativeCommunicationHistory(),
+        nativeCommunications,
         ...resumeData(text),
       },
     };
   }
   async extractJob(): Promise<Extraction<JobData>> {
-    if (!chatPage()) return unavailable("BOSS_UNSUPPORTED_PAGE");
+    if (!candidateDetailPage()) return unavailable("BOSS_UNSUPPORTED_PAGE");
     const value = jobName(pageText());
-    return value
-      ? { status: "OK", value: { displayName: value } }
-      : unavailable();
+    // A BOSS job name is short. Anything longer is a polluted capture from a
+    // layout we have not seen yet, so fail closed instead of storing it.
+    if (!value || value.length > 60 || /^(沟通职位|期望|薪资)$/.test(value)) {
+      return unavailable("BOSS_JOB_IDENTITY_UNCERTAIN");
+    }
+    return { status: "OK", value: { displayName: value } };
   }
   observePageChange(callback: () => void) {
     return observeBossPage(callback);

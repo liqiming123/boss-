@@ -4,7 +4,9 @@
 pnpm --filter @recruitment/extension build
 ```
 
-Chrome 打开 `chrome://extensions`，启用开发者模式，选择“加载已解压的扩展程序”，目录为 `apps/extension/dist`。插件无需内部账号登录，会自动读取 BOSS 右上角招聘人员姓名。打开扩展弹窗可绑定或解绑飞书个人身份；设置页可修改 API 地址，生产地址必须是 HTTPS。
+Chrome 或 Microsoft Edge 打开扩展管理页（Chrome 为 `chrome://extensions`，Edge 为 `edge://extensions`），启用“开发者模式”，选择“加载已解压的扩展程序”，目录为 `apps/extension/dist`。Edge 使用 Chromium MV3 API，与 Chrome 共用同一构建产物；如浏览器提示重新加载，点击扩展卡片上的“重新加载”即可。插件无需内部账号登录，会自动读取 BOSS 右上角招聘人员姓名。打开扩展弹窗可绑定或解绑飞书个人身份；设置页可修改 API 地址，生产地址必须是 HTTPS。
+
+构建扩展：在仓库根目录执行 `pnpm --filter @recruitment/extension build`，然后将生成的 `apps/extension/dist` 加载到 Chrome 或 Edge。发送消息的截图严格在消息确认登记成功后采集，并等待 BOSS 气泡渲染完成。
 
 当前无域名验收阶段，先运行 `ssh -N -L 127.0.0.1:8000:127.0.0.1:18082 databoard-server`，设置页填写 `http://localhost:8000/api/v1`。域名正式上线后改为 `https://ai.wuxistar.com/api/v1`，无需重新打包含固定服务器地址的扩展包。
 

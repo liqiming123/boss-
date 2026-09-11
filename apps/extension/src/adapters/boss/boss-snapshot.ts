@@ -15,44 +15,52 @@ export class SnapshotCaptureError extends Error {
 
 function chatScroller(): HTMLElement | null {
   const region = findBossConversationRegion();
+  const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
   const candidates = [
     ...(region
       ? [region, ...region.querySelectorAll<HTMLElement>("div,section,main")]
       : document.querySelectorAll<HTMLElement>("div,section,main")),
   ].filter((element) => {
-    const style = getComputedStyle(element),
-      rect = element.getBoundingClientRect(),
+    const rect = element.getBoundingClientRect(),
       text = element.innerText || "";
-    const scrollable =
-      element.scrollHeight > element.clientHeight + 40 &&
-      (/(auto|scroll)/.test(style.overflowY) || style.overflowY === "visible");
+    // BOSS frequently uses overflow:hidden plus wheel handlers on a nested
+    // viewport. Requiring a particular CSS overflow value made the same
+    // conversation fall back to a single latest-message crop on some
+    // accounts/layouts. Scroll geometry is the reliable signal here.
+    const scrollable = element.scrollHeight > element.clientHeight + 24;
     return (
       scrollable &&
-      rect.width > 420 &&
-      rect.height > 260 &&
-      rect.left > document.documentElement.clientWidth * 0.32 &&
+      rect.width > Math.min(420, viewportWidth * 0.38) &&
+      rect.height > 220 &&
+      rect.left > viewportWidth * 0.25 &&
       !/全部职位/.test(text) &&
       (text.match(/\d{1,2}\s*岁/g) || []).length < 2
     );
   });
+  // The outer right-hand shell is usually the largest scrollable node. It
+  // contains the candidate header, job panel and sometimes the left list, so
+  // choosing it produces a visually valid but semantically wrong screenshot.
+  // Prefer the smallest qualifying scroll container: in BOSS layouts this is
+  // the actual virtualized message viewport. The geometry/evidence filters
+  // above keep tiny nested bubbles out of the candidate set.
   const ranked = candidates.sort(
     (a, b) =>
-      b.getBoundingClientRect().width * b.getBoundingClientRect().height -
-      a.getBoundingClientRect().width * a.getBoundingClientRect().height,
+      a.getBoundingClientRect().width * a.getBoundingClientRect().height -
+      b.getBoundingClientRect().width * b.getBoundingClientRect().height,
   );
   if (ranked[0]) return ranked[0];
   // Virtualized BOSS layouts may not expose overflow CSS. Fall back to the
   // smallest visible right-hand panel containing conversation evidence.
   const visiblePanels = region
-    ? [region]
+    ? [region, ...region.querySelectorAll<HTMLElement>("div,section,main")]
     : [...document.querySelectorAll<HTMLElement>("body *")]
     .filter((element) => element.children.length > 0)
     .filter((element) => {
       const rect = element.getBoundingClientRect();
       const text = element.innerText || "";
       return (
-        rect.left > document.documentElement.clientWidth * 0.38 &&
-        rect.width > 480 &&
+        rect.left > viewportWidth * 0.25 &&
+        rect.width > Math.min(360, viewportWidth * 0.35) &&
         rect.height > 160 &&
         rect.top >= 0 &&
         /送达|沟通职位|沟通记录/.test(text)
@@ -77,16 +85,20 @@ async function imageFromDataUrl(dataUrl: string) {
   });
   return image;
 }
-async function captureCrop(element: CaptureTarget): Promise<HTMLCanvasElement> {
+async function captureCrop(element: CaptureTarget, fallback = false): Promise<HTMLCanvasElement> {
   const response = await sendRuntimeMessage<{ ok: boolean; data?: { dataUrl: string }; error?: string }>({
     type: "CAPTURE_VISIBLE_TAB",
-    payload: {},
+    payload: { fallback },
   });
   if (!response.ok || !response.data?.dataUrl)
     throw new SnapshotCaptureError(response.error || "SCREENSHOT_CAPTURE_FAILED");
   const image = await imageFromDataUrl(response.data.dataUrl),
     rect = element.getBoundingClientRect(),
     scale = image.width / window.innerWidth;
+  // A hidden Chrome tab can report a 1px compositor viewport. Never upload
+  // that blank strip; retry once using the compositor-surface capture path.
+  if (!fallback && (image.width < 300 || image.height < 200))
+    return captureCrop(element, true);
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.floor(rect.width * scale));
   canvas.height = Math.max(1, Math.floor(rect.height * scale));

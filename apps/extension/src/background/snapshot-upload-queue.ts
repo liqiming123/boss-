@@ -1,4 +1,5 @@
 import { apiFormRequest } from "./api-client";
+import { getAuth } from "./auth-store";
 import {
   enqueueBounded,
   readStoredQueue,
@@ -62,9 +63,13 @@ export async function queueSnapshot(payload: SnapshotPayload) {
   chrome.alarms.create("recruitment-snapshot-retry", { periodInMinutes: 5 });
 }
 export async function flushSnapshotQueue() {
+  const session = await getAuth();
+  if (!session.accessToken) return;
   const queue = await readStoredQueue(STORAGE_KEY, valid),
     remaining: SnapshotPayload[] = [];
   for (let index = 0; index < queue.length; index++) {
+    const current = await getAuth();
+    if (!current.accessToken || current.deviceId !== session.deviceId) return;
     try {
       await uploadSnapshotPayload(queue[index]);
     } catch (error) {

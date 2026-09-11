@@ -2,80 +2,16 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useAuthStore } from "../stores/auth";
-const props = defineProps<{ resource: string }>(),
-  auth = useAuthStore(),
-  rows = ref<Record<string, unknown>[]>([]),
-  loading = ref(false),
-  search = ref("");
-const filteredRows = computed(() =>
-  rows.value.filter((row) => JSON.stringify(row).includes(search.value)),
-);
-const visibleColumns = computed(() =>
-  Object.keys(rows.value[0] ?? {})
-    .filter((key) => !["password_hash", "refresh_token_hash"].includes(key))
-    .slice(0, 8),
-);
-async function load() {
-  loading.value = true;
-  try {
-    rows.value = await auth.client.list(props.resource);
-  } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : "加载失败");
-  } finally {
-    loading.value = false;
-  }
-}
-async function action(row: Record<string, unknown>, name: string) {
-  const reason = await ElMessageBox.prompt("请输入操作原因", "确认操作")
-    .then((v) => v.value)
-    .catch(() => null);
-  if (!reason) return;
-  await auth.client.request(`/conflicts/${row.id}/${name}`, {
-    method: "POST",
-    body: JSON.stringify({ reason }),
-  });
-  ElMessage.success("操作成功");
-  load();
-}
-onMounted(load);
-watch(() => props.resource, load);
+const props = defineProps<{ resource: string }>(), auth = useAuthStore();
+const rows = ref<Record<string, any>[]>([]), loading = ref(false), search = ref(""), dialog = ref(false), editing = ref<Record<string, any> | null>(null), form = ref<Record<string, any>>({}), saving = ref(false);
+const editableResources = new Set(["recruiters", "accounts", "jobs", "candidate-sources", "interviews"]), creatableResources = new Set(["recruiters", "accounts", "jobs"]);
+const fields: Record<string, { key: string; label: string; type?: string; required?: boolean }[]> = { recruiters: [{key:"display_name",label:"姓名",required:true},{key:"email",label:"邮箱",required:true},{key:"role",label:"角色"},{key:"status",label:"状态"},{key:"password",label:"新密码",type:"password"}], accounts: [{key:"recruiter_id",label:"招聘者 ID",required:true},{key:"platform",label:"平台"},{key:"platform_account_key",label:"平台账号标识",required:true},{key:"account_display_name",label:"账号名称",required:true},{key:"status",label:"状态"}], jobs: [{key:"code",label:"岗位编码",required:true},{key:"canonical_name",label:"岗位名称",required:true},{key:"category",label:"岗位类别",required:true},{key:"status",label:"状态"}], "candidate-sources": [{key:"candidate_display_name",label:"候选人姓名"},{key:"candidate_age",label:"年龄",type:"number"},{key:"candidate_experience",label:"经验"},{key:"candidate_education",label:"学历"},{key:"recruitment_status",label:"招聘状态"},{key:"status_evidence",label:"状态依据"}], interviews: [{key:"scheduled_at",label:"面试时间",type:"datetime-local"},{key:"duration_minutes",label:"时长（分钟）",type:"number"},{key:"location_type",label:"地点类型"},{key:"location_text",label:"地点"},{key:"status",label:"状态"},{key:"result",label:"结果"},{key:"notes",label:"备注"}] };
+const filteredRows = computed(() => rows.value.filter((row) => JSON.stringify(row).toLowerCase().includes(search.value.toLowerCase()))), visibleColumns = computed(() => Object.keys(rows.value[0] ?? {}).filter((key) => !["password_hash","refresh_token_hash"].includes(key)).slice(0,8)), canEdit = computed(() => editableResources.has(props.resource)), canCreate = computed(() => creatableResources.has(props.resource));
+async function load() { loading.value=true; try { rows.value=await auth.client.list(props.resource); } catch(e) { ElMessage.error(e instanceof Error?e.message:"加载失败"); } finally { loading.value=false; } }
+function openEditor(row?: Record<string,any>) { editing.value=row??null; const next:Record<string,any>={}; for(const f of fields[props.resource]??[]) next[f.key]=row?.[f.key]??(f.key==="platform"?"boss":f.key==="status"?"ACTIVE":""); form.value=next; dialog.value=true; }
+async function save() { saving.value=true; try { const payload={...form.value}; if(!payload.password) delete payload.password; const path=editing.value?`/admin/${props.resource}/${editing.value.id}`:`/admin/${props.resource}`; await auth.client.request(path,{method:editing.value?"PATCH":"POST",body:JSON.stringify(payload)}); ElMessage.success(editing.value?"已保存":"已创建"); dialog.value=false; await load(); } catch(e) { ElMessage.error(e instanceof Error?e.message:"保存失败"); } finally { saving.value=false; } }
+async function remove(row:Record<string,any>) { try { await ElMessageBox.confirm(`确定删除“${row.display_name??row.account_display_name??row.canonical_name??row.candidate_display_name??row.id}”？删除后不可恢复。`,`删除记录`,{type:"warning",confirmButtonText:"删除",cancelButtonText:"取消"}); await auth.client.request(`/admin/${props.resource}/${row.id}`,{method:"DELETE"}); ElMessage.success("已删除"); await load(); } catch(e) { if(e!=="cancel"&&e!=="close") ElMessage.error(e instanceof Error?e.message:"删除失败"); } }
+async function conflictAction(row:Record<string,any>,name:string) { const reason=await ElMessageBox.prompt("请输入操作原因","确认操作").then(v=>v.value).catch(()=>null); if(!reason)return; await auth.client.request(`/conflicts/${row.id}/${name}`,{method:"POST",body:JSON.stringify({reason})}); ElMessage.success("操作成功"); load(); }
+onMounted(load); watch(()=>props.resource,load);
 </script>
-<template>
-  <div class="page-card">
-    <div
-      style="display: flex; justify-content: space-between; margin-bottom: 16px"
-    >
-      <el-input
-        v-model="search"
-        clearable
-        placeholder="筛选当前页"
-        style="width: 280px"
-      /><el-button @click="load">刷新</el-button>
-    </div>
-    <el-table v-loading="loading" :data="filteredRows" stripe
-      ><el-table-column
-        v-for="key in visibleColumns"
-        :key="key"
-        :prop="key"
-        :label="key"
-        show-overflow-tooltip
-      /><el-table-column
-        v-if="resource === 'conflicts'"
-        label="操作"
-        width="230"
-        ><template #default="scope"
-          ><el-button
-            link
-            type="primary"
-            @click="action(scope.row, 'acknowledge')"
-            >知悉</el-button
-          ><el-button link type="danger" @click="action(scope.row, 'exclude')"
-            >排除</el-button
-          ><el-button link @click="action(scope.row, 'request-transfer')"
-            >申请转交</el-button
-          ></template
-        ></el-table-column
-      ></el-table
-    ><el-empty v-if="!loading && !rows.length" description="暂无数据" />
-  </div>
-</template>
+<template><div class="page-card"><div class="resource-toolbar"><el-input v-model="search" clearable placeholder="筛选当前页" style="width:280px"/><div><el-button @click="load">刷新</el-button><el-button v-if="canCreate" type="primary" @click="openEditor()">新增</el-button></div></div><el-table v-loading="loading" :data="filteredRows" stripe><el-table-column v-for="key in visibleColumns" :key="key" :prop="key" :label="key" show-overflow-tooltip/><el-table-column v-if="canEdit||resource==='conflicts'" label="操作" width="190" fixed="right"><template #default="scope"><el-button v-if="canEdit" link type="primary" @click="openEditor(scope.row)">编辑</el-button><el-button v-if="canEdit" link type="danger" @click="remove(scope.row)">删除</el-button><template v-if="resource==='conflicts'"><el-button link type="primary" @click="conflictAction(scope.row,'acknowledge')">知悉</el-button><el-button link type="danger" @click="conflictAction(scope.row,'exclude')">排除</el-button></template></template></el-table-column></el-table><el-empty v-if="!loading&&!rows.length" description="暂无数据"/><el-dialog v-model="dialog" :title="editing?'编辑记录':'新增记录'" width="520px"><el-form label-position="top"><el-form-item v-for="field in fields[resource]" :key="field.key" :label="field.label" :required="field.required"><el-input v-model="form[field.key]" :type="field.type==='password'?'password':'text'" :show-password="field.type==='password'" :placeholder="field.type==='password'&&editing?'留空表示不修改':''"/></el-form-item></el-form><template #footer><el-button @click="dialog=false">取消</el-button><el-button type="primary" :loading="saving" @click="save">保存</el-button></template></el-dialog></div></template>

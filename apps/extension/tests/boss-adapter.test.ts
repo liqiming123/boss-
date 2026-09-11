@@ -22,6 +22,18 @@ describe("Boss adapter", () => {
       false,
     );
   });
+  it("extracts the account on communication list variants used for background scans", async () => {
+    history.replaceState({}, "", "/web/chat/interaction");
+    document.body.innerText = "职位管理\n账号权益\n李先生\n互动\n候选人列表";
+    expect(await new BossAdapter().extractAccount()).toEqual({
+      status: "OK",
+      value: { displayName: "李先生" },
+    });
+    expect(new BossAdapter().isCandidateConversationPage()).toBe(false);
+    document.body.innerText =
+      "职位管理\n账号权益\n李先生\n互动\n黄海南\n23岁\n沟通职位：业务助理";
+    expect(new BossAdapter().isCandidateConversationPage()).toBe(true);
+  });
   it("extracts the split-line candidate layout used by the chat detail panel", async () => {
     document.body.innerText =
       "职位管理\n升级VIP\n李先生\n沟通\n黄海南\n刚刚活跃\n28岁\n6年\n本科\n沟通职位：\nai应用开发工程师";
@@ -78,6 +90,121 @@ describe("Boss adapter", () => {
       status: "OK",
       value: { displayName: "王睿", age: 22 },
     });
+  });
+  it("keeps profile extraction working when age is omitted and accepts expanded experience formats", async () => {
+    document.body.innerText =
+      "升级VIP\n成珈莉\n顾嘉雯\n刚刚活跃\n工作经验：1-3年\n本科\n沟通职位：业务助理/总经理助理";
+    expect(await new BossAdapter().extractCandidate()).toMatchObject({
+      status: "OK",
+      value: { displayName: "顾嘉雯", experience: "1-3年", education: "本科" },
+    });
+  });
+  it("preserves graduation cohort instead of reading it as years of experience", async () => {
+    document.body.innerText =
+      "升级VIP\n成珈莉\n陈明俊\n22岁\n26届\n本科\n沟通职位：ai应用开发工程师\n我是26年毕业生";
+    expect(await new BossAdapter().extractCandidate()).toMatchObject({
+      status: "OK",
+      value: {
+        displayName: "陈明俊",
+        age: 22,
+        experience: "26届",
+        education: "本科",
+      },
+    });
+  });
+  it("does not read a graduation year as work experience", async () => {
+    document.body.innerText =
+      "升级VIP\n成珈莉\n朱雨晴\n刚刚活跃\n24岁\n26年毕业\n硕士\n沟通职位：海外社媒运营";
+    expect(await new BossAdapter().extractCandidate()).toMatchObject({
+      status: "OK",
+      value: {
+        displayName: "朱雨晴",
+        age: 24,
+        experience: "26届",
+        education: "硕士",
+      },
+    });
+    document.body.innerText =
+      "升级VIP\n成珈莉\n加油\n20岁\n2027年毕业生\n大专\n沟通职位：美妆博主(店播)";
+    expect(await new BossAdapter().extractCandidate()).toMatchObject({
+      status: "OK",
+      value: {
+        displayName: "加油",
+        age: 20,
+        experience: "27届",
+        education: "大专",
+      },
+    });
+    document.body.innerText =
+      "升级VIP\n成珈莉\n小金\n24岁\n26年应届\n本科\n沟通职位：业务助理/总经理助理";
+    expect(await new BossAdapter().extractCandidate()).toMatchObject({
+      status: "OK",
+      value: {
+        displayName: "小金",
+        age: 24,
+        experience: "26届",
+        education: "本科",
+      },
+    });
+  });
+  it("prefers real experience over a graduation cohort on the same profile", async () => {
+    document.body.innerText =
+      "升级VIP\n成珈莉\n谢玉媛\n33岁\n10年\n本科\n26届\n沟通职位：财务主管";
+    expect(await new BossAdapter().extractCandidate()).toMatchObject({
+      status: "OK",
+      value: { displayName: "谢玉媛", age: 33, experience: "10年" },
+    });
+  });
+  it("never reads a calendar date as work experience", async () => {
+    document.body.innerText =
+      "升级VIP\n成珈莉\n刘雅丽\n30岁\n2026年09月09日 12:32\n中专\n沟通职位：美妆博主(店播)";
+    const result = await new BossAdapter().extractCandidate();
+    if (result.status !== "OK")
+      throw new Error("expected a candidate extraction");
+    expect(result.value).toMatchObject({ displayName: "刘雅丽", age: 30 });
+    expect(result.value.experience).toBeUndefined();
+  });
+  it("rejects the conversation-list load-more control as a candidate", async () => {
+    document.body.innerText =
+      "职位管理\n升级VIP\n李先生\n沟通\n滚动加载更多\n26岁\n7年\n本科\n沟通职位：美妆博主(店播)";
+    const result = await new BossAdapter().extractCandidate();
+    expect(result.status).toBe("ERROR");
+  });
+  it("trims the candidate profile tail from the job label", async () => {
+    document.body.innerText =
+      "升级VIP\n成珈莉\n谢玉媛\n33岁\n10年\n本科\n沟通职位：财务主管 最近关注：无锡";
+    expect(await new BossAdapter().extractJob()).toEqual({
+      status: "OK",
+      value: { displayName: "财务主管" },
+    });
+  });
+  it("cuts the chat text BOSS renders on the job label line", async () => {
+    document.body.innerText =
+      "升级VIP\n成珈莉\n谢玉媛\n33岁\n10年\n本科\n沟通职位：财务主管 最近关注: 无锡 · 财务经理/主管 8-12K 昨天 16:39 已读 你好,经理这边说可以安排面试,我先给你说下公司情况";
+    expect(await new BossAdapter().extractJob()).toEqual({
+      status: "OK",
+      value: { displayName: "财务主管" },
+    });
+    document.body.innerText =
+      "升级VIP\n成珈莉\n某候选人\n25岁\n2年\n本科\n沟通职位：直播助播 您好,我想和您沟通下这个职位的细节,期待您的回复 干过有两年经验会投流选品";
+    expect(await new BossAdapter().extractJob()).toEqual({
+      status: "OK",
+      value: { displayName: "直播助播" },
+    });
+  });
+  it("keeps legitimate compound job titles intact", async () => {
+    for (const title of [
+      "业务助理/总经理助理",
+      "ai应用开发工程师",
+      "美妆博主(店播)",
+      "AI生成师(抽卡师)",
+    ]) {
+      document.body.innerText = `升级VIP\n成珈莉\n某候选人\n25岁\n2年\n本科\n沟通职位：${title}`;
+      expect(await new BossAdapter().extractJob()).toEqual({
+        status: "OK",
+        value: { displayName: title },
+      });
+    }
   });
   it("does not treat an unsent recruiter quick-action template as outbound", async () => {
     document.body.innerText =

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,8 @@ from recruitment_collab.infrastructure.models import (
     ConflictExclusion,
     DuplicateLookupAlert,
     Engagement,
+    FeishuBitableConfig,
+    Interview,
     JobAlias,
     NotificationOutbox,
     Recruiter,
@@ -39,6 +42,8 @@ from recruitment_collab.infrastructure.models import (
     UnmappedJob,
     now,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ApplicationError(ValueError):
@@ -51,8 +56,24 @@ def _epoch(value: datetime) -> float:
     return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
 
 
+def _iso_time(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc).isoformat()
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=value.tzinfo or timezone.utc).isoformat()
+    return str(value)
+
+
 STATUS_RANK = {"沟通中": 0, "已获取简历": 1, "已交换联系方式": 2, "待约面": 3, "已约面": 4, "已拒绝": 5, "已入职": 6}
 TERMINAL_STATUSES = {"已拒绝", "已入职"}
+# The historical chat snapshot scrolls the recruiter's own conversation pane.
+# Requesting it on every conversation open made the plugin fight the user for
+# the scroll position, so only the confirmed interview invitation -- the action
+# that actually advances the candidate to 已约面 -- may ask for a capture.
+INVITE_STATUS = "已约面"
+INVITE_EVIDENCE = {"BOSS_INTERVIEW_MARKER", "BOSS_INTERVIEW_INVITE"}
 
 
 @dataclass(frozen=True)
@@ -106,6 +127,7 @@ class RecruitmentCollaborationService:
     def check_context(self, company_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         account, current_recruiter = self._page_identity(company_id, payload, create=False)
         actor_id = current_recruiter.id if current_recruiter else f"unregistered:{self._page_identity_hash(company_id, payload)}"
+        recruiter_label = self._recruiter_label(current_recruiter, payload["account_display_name"])
         job, normalized_job = self._resolve_job(company_id, payload)
         probe = CandidateSource(
             company_id=company_id,
@@ -123,26 +145,38 @@ class RecruitmentCollaborationService:
             extractor_version=payload["extractor_version"],
         )
         signature = self._identity_signature(payload)
+        # Duplicate evidence is kept in PostgreSQL.  Feishu is the durable
+        # business table, but it intentionally no longer receives opaque
+        # identifiers/signatures, so the API must not depend on those columns
+        # being present for a lookup to work.
+        probe.candidate_age = payload.get("candidate_age")
+        probe.candidate_experience = normalize_experience(payload.get("candidate_experience") or "")
+        probe.candidate_education = normalize_education(payload.get("candidate_education") or "")
+        probe.candidate_identity_signature = signature
         feishu_available = True
+        matches = self._find_matches(probe, actor_id, company_id, job.category if job else None)
         if get_settings().feishu_mode == "real":
             try:
-                matches = self._feishu_matches(
+                legacy_matches = self._feishu_matches(
+                    company_id,
                     signature,
                     payload["candidate_display_name"],
                     payload["job_display_name"],
                     job.canonical_name if job else "",
-                    payload["account_display_name"],
+                    recruiter_label,
                 )
+                # Keep compatibility with rows written before the field
+                # projection was reduced. New rows are matched from the
+                # backend and therefore do not require technical Feishu
+                # columns. Avoid returning the same backend row twice.
+                seen = {str(item.get("candidate_source_id")) for item in matches}
+                matches.extend(item for item in legacy_matches if str(item.get("candidate_source_id")) not in seen)
             except Exception as exc:
-                if not payload.get("native_communications"):
+                if not payload.get("native_communications") and not matches:
                     raise ApplicationError("FEISHU_LOOKUP_UNAVAILABLE", "飞书查重暂不可用，请稍后重试", 503) from exc
-                matches, feishu_available = [], False
+                feishu_available = False
         else:
-            probe.candidate_age = payload.get("candidate_age")
-            probe.candidate_experience = normalize_experience(payload.get("candidate_experience") or "")
-            probe.candidate_education = normalize_education(payload.get("candidate_education") or "")
-            probe.candidate_identity_signature = signature
-            matches = self._find_matches(probe, actor_id, company_id, job.category if job else None)
+            pass
         matches = self._merge_native_matches(payload.get("native_communications") or [], payload["account_display_name"], matches, feishu_available)
         queued = self._queue_lookup_alerts(company_id, current_recruiter, payload, matches)
         if queued:
@@ -151,7 +185,7 @@ class RecruitmentCollaborationService:
         result["lookup_notifications_queued"] = queued
         result["feishu_lookup_status"] = "AVAILABLE" if feishu_available else "UNAVAILABLE"
         result["result_type"] = result["result_type"] if matches else "CHECK_ONLY_NO_HISTORY"
-        result["ui"] = result["ui"] if matches else {"severity": "success", "title": "检查完成", "message": "尚未发送消息，不创建记录"}
+        result["ui"] = result["ui"] if matches else {"severity": "success", "title": "检查完成", "message": "未发现其他招聘账号的同步记录"}
         return result
 
     @staticmethod
@@ -212,8 +246,27 @@ class RecruitmentCollaborationService:
         return candidate_identity_signature(payload["candidate_display_name"], int(age), str(experience), str(education))
 
     @staticmethod
-    def _feishu_matches(signature: str | None, candidate_name: str, job_name: str, canonical_job_name: str, current_recruiter: str) -> list[dict[str, Any]]:
-        client = BitableSyncClient(get_settings())
+    def _recruiter_label(recruiter: Recruiter | None, fallback: str = "") -> str:
+        """Use the bound Feishu identity in user-facing records.
+
+        The BOSS page display name is retained only as a technical account
+        mapping key; it must not leak into the candidate table when a Feishu
+        identity is bound.
+        """
+        return (recruiter.feishu_display_name if recruiter and recruiter.feishu_display_name else (recruiter.display_name if recruiter else fallback)).strip()
+
+    def _feishu_matches(
+        self, company_id: str, signature: str | None, candidate_name: str, job_name: str, canonical_job_name: str, current_recruiter: str
+    ) -> list[dict[str, Any]]:
+        settings = get_settings()
+        config = self.session.scalar(
+            select(FeishuBitableConfig).where(FeishuBitableConfig.company_id == company_id, FeishuBitableConfig.status == "ACTIVE")
+        )
+        client = BitableSyncClient(
+            settings,
+            app_token=config.app_token if config else None,
+            candidate_table_id=config.candidate_table_id if config else None,
+        )
         rows = client.find_system_candidates(signature, current_recruiter, candidate_name, job_name, canonical_job_name)
         matches = []
         for row in rows:
@@ -223,12 +276,18 @@ class RecruitmentCollaborationService:
                 {
                     "match_level": row.get("match_level", "EXACT_IDENTITY"),
                     "candidate_source_id": str(row.get("record_id") or client.plain_value(row.get("系统记录标识"))),
-                    "recruiter_id": client.plain_value(row.get("当前招聘者")),
-                    "recruiter_name": client.plain_value(row.get("当前招聘者")),
+                    # Bitable stores the human recruiter label, not the
+                    # database UUID. Resolve it inside the company before
+                    # queuing notifications instead of passing a name to a
+                    # UUID lookup.
+                    "recruiter_id": None,
+                    "recruiter_name": client.plain_value(row.get("飞书账号") or row.get("当前招聘者")),
                     "job_id": None,
                     "job_name": client.plain_value(row.get("BOSS岗位") or row.get("标准岗位")),
                     "stage": status,
                     "updated_at": updated_at,
+                    "first_contact_at": _iso_time(row.get("开始聊天时间")),
+                    "last_activity_at": _iso_time(updated_at),
                     "match_reason": "姓名、年龄、工作年限、学历完全一致（飞书系统记录）"
                     if row.get("match_level") != "SUSPECTED_SAME_NAME_JOB"
                     else "标准化姓名和岗位一致（飞书系统记录）",
@@ -256,7 +315,7 @@ class RecruitmentCollaborationService:
                 continue
             matched = self.session.get(Recruiter, match.get("recruiter_id")) if match.get("recruiter_id") else None
             if not matched:
-                matched = self.page_recruiter(company_id, matched_name)
+                matched = self._recruiter_by_label(company_id, matched_name)
             target_key = matched.id if matched else CandidateNameNormalizer().normalize(matched_name)
             alert_key = hashlib.sha256(f"{company_id}|{viewer.id}|{target_key}|{identity}|{normalized_job}".encode()).hexdigest()
             alert = self._activate_lookup_alert(
@@ -277,17 +336,27 @@ class RecruitmentCollaborationService:
             if not alert:
                 continue
             alert.notification_version += 1
+            viewer_label = self._recruiter_label(viewer, viewer.display_name)
             payload_json = {
                 "type": "DUPLICATE_LOOKUP",
                 "lookup_alert_id": alert.id,
                 "candidate_name": payload["candidate_display_name"],
                 "job_name": payload["job_display_name"],
-                "viewer_name": viewer.display_name,
+                "viewer_name": viewer_label,
                 "matched_recruiter_name": matched_name,
+                "first_contact_at": _iso_time(match.get("first_contact_at")),
+                "last_activity_at": _iso_time(match.get("last_activity_at") or match.get("updated_at")),
+                "current_action": "你正在查看该候选人，尚未确认发送消息",
                 "match_level": alert.match_level,
                 "match_reason": alert.match_reason,
             }
-            recipients = {viewer.id, *([matched.id] if matched else [])}
+            # Browsing a candidate is not a follow-up action, so only the person
+            # who is looking at it is warned. The recruiter who already
+            # contacted the candidate is deliberately NOT pinged here: the
+            # previous behaviour alerted them every time a colleague merely
+            # opened the profile, which is pure noise. They are notified only
+            # once a real message is sent and a conflict is recorded.
+            recipients = {viewer.id}
             created = self._queue_notifications(
                 company_id,
                 "DUPLICATE_LOOKUP",
@@ -301,6 +370,32 @@ class RecruitmentCollaborationService:
                 alert.last_notified_at = current_time
                 queued_count += created
         return queued_count
+
+    def _recruiter_by_label(self, company_id: str, label: str) -> Recruiter | None:
+        """Resolve a table-facing recruiter label to the active identity.
+
+        Prefer a bound Feishu display name because candidate-table rows use
+        that label. Fall back to the BOSS/page display name for legacy rows.
+        """
+        normalized = label.strip()
+        if not normalized:
+            return None
+        bound = self.session.scalar(
+            select(Recruiter).where(
+                Recruiter.company_id == company_id,
+                Recruiter.status == "ACTIVE",
+                Recruiter.feishu_display_name == normalized,
+            )
+        )
+        if bound:
+            return bound
+        return self.session.scalar(
+            select(Recruiter).where(
+                Recruiter.company_id == company_id,
+                Recruiter.status == "ACTIVE",
+                Recruiter.display_name == normalized,
+            )
+        )
 
     def _activate_lookup_alert(self, draft: DuplicateLookupAlert, detected_at: datetime) -> DuplicateLookupAlert | None:
         alert = self.session.scalar(select(DuplicateLookupAlert).where(DuplicateLookupAlert.alert_key == draft.alert_key))
@@ -423,6 +518,73 @@ class RecruitmentCollaborationService:
         """Resolve a BOSS page identity without coupling OAuth routes to persistence details."""
         return self._page_identity(company_id, {"platform": "boss", "account_display_name": display_name}, create)[1]
 
+    def _store_invited_interview(
+        self,
+        source: CandidateSource,
+        page: "PageActorContext",
+        job: RecruitmentJob | None,
+        payload: dict[str, Any],
+    ) -> None:
+        """Persist the optional interview schedule without risking the status.
+
+        The 已约面 status is the business fact that must always synchronize; the
+        calendar entry is a bonus read from BOSS's dialog. A savepoint keeps a
+        failure here from aborting or rolling back the invitation itself.
+        """
+        try:
+            with self.session.begin_nested():
+                self._upsert_invited_interview(source, page, job, payload)
+        except Exception as exc:  # defensive isolation, never silent to logs
+            logger.warning(
+                "interview schedule was not stored for candidate source %s: %s",
+                source.id,
+                type(exc).__name__,
+            )
+
+    def _upsert_invited_interview(
+        self,
+        source: CandidateSource,
+        page: "PageActorContext",
+        job: RecruitmentJob | None,
+        payload: dict[str, Any],
+    ) -> None:
+        """Persist the interview the recruiter scheduled in BOSS's dialog.
+
+        Only a fully resolved date and time is stored: an invitation whose
+        schedule could not be read must never fabricate a calendar entry. The
+        write is idempotent per candidate source so a repeated send updates the
+        same row instead of stacking duplicates.
+        """
+        details = payload.get("interview") or {}
+        scheduled_at = details.get("scheduled_at")
+        if not scheduled_at:
+            return
+        row = self.session.scalar(
+            select(Interview).where(
+                Interview.company_id == page.company_id,
+                Interview.candidate_source_id == source.id,
+            )
+        )
+        if row is None:
+            row = Interview(
+                company_id=page.company_id,
+                candidate_source_id=source.id,
+                recruiter_id=page.actor_id,
+                scheduled_at=scheduled_at,
+            )
+            self.session.add(row)
+        row.job_id = source.job_id or (job.id if job else None)
+        row.recruiter_id = page.actor_id
+        row.scheduled_at = scheduled_at
+        row.location_type = details.get("interview_type") or row.location_type or "ONLINE"
+        location = str(details.get("location") or "").strip()
+        if location:
+            row.location_text = location
+        row.status = "SCHEDULED"
+        if not row.notes:
+            row.notes = "BOSS 面试邀约自动识别"
+        self.session.flush()
+
     def record_message_sent(self, company_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         account, current_recruiter = self._page_identity(company_id, payload, create=True)
         if not account or not current_recruiter:  # create=True guarantees both; keeps the invariant explicit to type checkers.
@@ -434,8 +596,10 @@ class RecruitmentCollaborationService:
 
         job, normalized_job = self._resolve_job(company_id, payload, track_unmapped=True)
         context = MessageContext(page, job, normalized_job, payload)
-        source, started_at, updated_at = self._upsert_candidate_source(context)
+        source, started_at, updated_at, invite_confirmed = self._upsert_candidate_source(context, confirmed_send=True)
         self._upsert_engagement(page, source, started_at, updated_at)
+        if invite_confirmed:
+            self._store_invited_interview(source, page, job, payload)
         self.session.add(
             RecruitmentEvent(
                 company_id=company_id,
@@ -451,8 +615,71 @@ class RecruitmentCollaborationService:
         )
         self.session.flush()
         matches = self._find_matches(source, page.actor_id, company_id, job.category if job else None)
+        # Re-run the notification path after a confirmed outbound message.
+        # The pre-send context check is best-effort; the send event is the
+        # authoritative point at which the candidate is synced and any
+        # cross-recruiter match must be surfaced to the user.
+        lookup_notifications_queued = self._queue_lookup_alerts(company_id, current_recruiter, payload, matches)
         self._create_conflicts(source, page.actor_id, company_id)
-        return self._commit_candidate_response(source, account, job, current_recruiter, matches)
+        result = self._commit_candidate_response(source, account, job, current_recruiter, matches)
+        result["snapshot_needed"] = invite_confirmed
+        result["lookup_notifications_queued"] = lookup_notifications_queued
+        return result
+
+    def sync_candidate_observation(self, company_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist a candidate opened in BOSS without claiming a message was sent.
+
+        Candidate selection is the synchronization trigger for every recruiter.
+        A real outbound message still goes through ``record_message_sent`` so
+        engagements and MESSAGE_SENT events retain their business meaning.
+        """
+        account, current_recruiter = self._page_identity(company_id, payload, create=True)
+        if not account or not current_recruiter:
+            raise ApplicationError("PAGE_RECRUITER_NOT_FOUND", "无法建立 BOSS 招聘人员身份", 500)
+        page = PageActorContext(company_id, account, current_recruiter)
+        job, normalized_job = self._resolve_job(company_id, payload, track_unmapped=True)
+        context = MessageContext(page, job, normalized_job, payload)
+        normalized_name = CandidateNameNormalizer().normalize(payload["candidate_display_name"])
+        prior_candidates = [
+            row
+            for row in self.session.scalars(
+                select(CandidateSource).where(
+                    CandidateSource.company_id == company_id,
+                    CandidateSource.platform == payload["platform"],
+                    CandidateSource.platform_account_id == account.id,
+                    CandidateSource.candidate_normalized_name == normalized_name,
+                )
+            ).all()
+            if JobNameNormalizer().normalize(row.raw_job_name) == normalized_job
+        ]
+        prior = max(
+            prior_candidates,
+            key=lambda row: _epoch(row.conversation_updated_at) if row.conversation_updated_at else float("-inf"),
+            default=None,
+        )
+        prior_updated_at = prior.conversation_updated_at if prior else None
+        source, _started_at, _updated_at, _invite_confirmed = self._upsert_candidate_source(context)
+        matches = self._find_matches(source, page.actor_id, company_id, job.category if job else None)
+        incoming_updated_at = payload.get("conversation_updated_at") or payload["sent_at"]
+        if prior_updated_at and _epoch(incoming_updated_at) <= _epoch(prior_updated_at):
+            result = self._response(source, account, job, current_recruiter, matches)
+            self.session.commit()
+            result["feishu_sync_status"] = "UNCHANGED"
+            result["snapshot_needed"] = False
+            result["lookup_notifications_queued"] = 0
+            result["sync_trigger"] = "CANDIDATE_OPENED"
+            return result
+        result = self._commit_candidate_response(source, account, job, current_recruiter, matches)
+        # Opening a conversation must never request the historical chat
+        # capture: it scrolls the recruiter's own pane. Screenshots are asked
+        # for only by a confirmed interview invitation (record_message_sent).
+        result["snapshot_needed"] = False
+        # The read-only context check owns click-time notifications. Keeping
+        # this write path notification-free allows lookup and persistence to
+        # run independently without duplicate-alert races.
+        result["lookup_notifications_queued"] = 0
+        result["sync_trigger"] = "CANDIDATE_OPENED"
+        return result
 
     def _existing_message_response(
         self,
@@ -469,7 +696,28 @@ class RecruitmentCollaborationService:
             raise ApplicationError("CANDIDATE_NOT_FOUND", "发送事件对应的候选人不存在", 404)
         job = self.session.get(RecruitmentJob, source.job_id) if source.job_id else None
         matches = self._find_matches(source, page.actor_id, page.company_id, job.category if job else None)
-        return self._commit_candidate_response(source, page.account, job, page.recruiter, matches, idempotent=True)
+        result = self._commit_candidate_response(
+            source,
+            page.account,
+            job,
+            page.recruiter,
+            matches,
+            idempotent=True,
+        )
+        # A catch-up scan reuses its deterministic idempotency key. If the
+        # original attempt carried an interview invitation but the screenshot
+        # upload failed, the idempotent response must still ask the extension
+        # to capture again; otherwise a transient capture error becomes
+        # permanent and the source remains FAILED forever. A non-invite retry
+        # must stay silent even when an old snapshot is missing.
+        invite_message = (
+            payload.get("recruitment_status") == INVITE_STATUS
+            or payload.get("status_evidence") in INVITE_EVIDENCE
+        )
+        result["snapshot_needed"] = invite_message and (
+            source.snapshot_status != "READY" or not source.snapshot_tokens_json
+        )
+        return result
 
     def _resolve_job(self, company_id: str, payload: dict[str, Any], *, track_unmapped: bool = False) -> tuple[RecruitmentJob | None, str]:
         normalized_job = JobNameNormalizer().normalize(payload["job_display_name"])
@@ -504,7 +752,7 @@ class RecruitmentCollaborationService:
             )
         return None, normalized_job
 
-    def _upsert_candidate_source(self, context: MessageContext) -> tuple[CandidateSource, datetime, datetime]:
+    def _upsert_candidate_source(self, context: MessageContext, *, confirmed_send: bool = False) -> tuple[CandidateSource, datetime, datetime, bool]:
         page, payload = context.page, context.payload
         url_hash = hashlib.sha256(payload["page_url"].encode()).hexdigest()
         source_scope = page.actor_id if payload["platform"] == "boss" else page.account.id
@@ -526,18 +774,36 @@ class RecruitmentCollaborationService:
         normalized_name = CandidateNameNormalizer().normalize(payload["candidate_display_name"])
         conversation_job_key = hashlib.sha256(f"{page.actor_id}|{signature or normalized_name}|{context.normalized_job}".encode()).hexdigest()
         source = self._find_candidate_source(context, identity, normalized_name, signature)
+        # A screenshot is an evidence artifact for the interview invitation,
+        # not for browsing. Passive observations therefore never request one;
+        # a confirmed send asks for a capture only when it actually hands the
+        # candidate an invitation.
+        invite_confirmed = confirmed_send and (
+            payload.get("recruitment_status") == INVITE_STATUS
+            or payload.get("status_evidence") in INVITE_EVIDENCE
+        )
         observation = {
             "candidate_display_name": payload["candidate_display_name"],
             "candidate_normalized_name": normalized_name,
-            "candidate_age": payload.get("candidate_age"),
-            "candidate_experience": normalize_experience(payload.get("candidate_experience") or "") or None,
-            "candidate_education": normalize_education(payload.get("candidate_education") or "") or None,
             "candidate_identity_signature": signature,
             "conversation_job_key": conversation_job_key,
             "raw_job_name": payload["job_display_name"],
             "page_url_hash": url_hash,
             "platform_candidate_id": payload.get("platform_candidate_id"),
         }
+        # A profile card can be temporarily incomplete while BOSS is
+        # re-rendering. Preserve an already-known value instead of replacing
+        # it with a transient null/empty observation. Explicit data removal
+        # is handled by a separate administrative flow, not by extraction.
+        candidate_age = payload.get("candidate_age")
+        candidate_experience = normalize_experience(payload.get("candidate_experience") or "") or None
+        candidate_education = normalize_education(payload.get("candidate_education") or "") or None
+        if candidate_age is not None:
+            observation["candidate_age"] = candidate_age
+        if candidate_experience:
+            observation["candidate_experience"] = candidate_experience
+        if candidate_education:
+            observation["candidate_education"] = candidate_education
         if source:
             for field, value in observation.items():
                 setattr(source, field, value)
@@ -551,6 +817,15 @@ class RecruitmentCollaborationService:
                 source.status_rule_version,
                 payload.get("status_rule_version"),
             )
+            if payload.get("status_evidence") == "RECRUITER_RECONTACT_INTENT":
+                # Only a newer confirmed outbound event can reopen an old
+                # conversation. Passive observations and delayed retries
+                # must not replace its current state.
+                accepted_status = None
+                if (confirmed_send and payload.get("recruitment_status") in {"沟通中", "待约面"}
+                        and (source.conversation_updated_at is None
+                             or _epoch(sent_at) > _epoch(source.conversation_updated_at))):
+                    accepted_status = (payload["recruitment_status"], "RECRUITER_RECONTACT_INTENT")
             if accepted_status:
                 source.recruitment_status, source.status_evidence = accepted_status
                 source.status_rule_version = payload.get("status_rule_version") or source.status_rule_version
@@ -560,7 +835,7 @@ class RecruitmentCollaborationService:
                 source.conversation_started_at = conversation_started_at
             if source.conversation_updated_at is None or _epoch(conversation_updated_at) > _epoch(source.conversation_updated_at):
                 source.conversation_updated_at = conversation_updated_at
-            return source, conversation_started_at, conversation_updated_at
+            return source, conversation_started_at, conversation_updated_at, invite_confirmed
         source = CandidateSource(
             company_id=page.company_id,
             platform=payload["platform"],
@@ -580,7 +855,9 @@ class RecruitmentCollaborationService:
         )
         self.session.add(source)
         self.session.flush()
-        return source, conversation_started_at, conversation_updated_at
+        # A brand-new source is only persisted here; whether it also needs a
+        # screenshot still depends on why it was created (see invite_confirmed).
+        return source, conversation_started_at, conversation_updated_at, invite_confirmed
 
     def _find_candidate_source(
         self,
@@ -611,6 +888,31 @@ class RecruitmentCollaborationService:
             )
         ).all()
         source = next((row for row in rows if JobNameNormalizer().normalize(row.raw_job_name) == context.normalized_job), None)
+        if source:
+            source.source_identity_key = identity
+            return source
+        # BOSS can change the exposed identity details (and therefore the
+        # derived signature) after a resume/profile refresh. For the same
+        # recruiter, reuse the existing name+job row instead of creating a
+        # second row. Recruiter ownership remains part of the source scope,
+        # so a different recruiter still creates a separate row.
+        candidates = self.session.scalars(
+            select(CandidateSource).where(
+                CandidateSource.company_id == page.company_id,
+                CandidateSource.platform == payload["platform"],
+                CandidateSource.platform_account_id == page.account.id,
+                CandidateSource.candidate_normalized_name == normalized_name,
+            )
+        ).all()
+        source = next(
+            (
+                row
+                for row in candidates
+                if JobNameNormalizer().normalize(row.raw_job_name) == context.normalized_job
+                and (not signature or not row.candidate_identity_signature)
+            ),
+            None,
+        )
         if source:
             source.source_identity_key = identity
         return source
@@ -671,6 +973,12 @@ class RecruitmentCollaborationService:
             source.job_id = job.id
             self._queue_source_sync(source, job=job)
         return len(matched)
+
+    def requeue_account_sources(self, account_id: str) -> int:
+        sources = self.session.scalars(select(CandidateSource).where(CandidateSource.platform_account_id == account_id)).all()
+        for source in sources:
+            self._queue_source_sync(source)
+        return len(sources)
 
     def _queue_candidate_sync(self, source: CandidateSource, fields: dict[str, Any]) -> None:
         """Coalesce candidate changes into one durable, retryable sync row."""
@@ -735,7 +1043,7 @@ class RecruitmentCollaborationService:
         idempotent: bool = False,
     ) -> dict[str, Any]:
         if not matches:
-            result_type, severity, title, message = "NO_HISTORY", "success", "暂无其他同事跟进记录", "招聘消息已登记"
+            result_type, severity, title, message = "NO_HISTORY", "success", "暂无其他同事记录", "候选人已同步"
         else:
             first = matches[0]
             result_type = {
@@ -751,7 +1059,18 @@ class RecruitmentCollaborationService:
         result: dict[str, Any] = {
             "candidate_source_id": source.id if source else None,
             "account_mapping": {"status": "MAPPED", "account_id": account.id} if account else {"status": "NOT_REQUIRED"},
-            "job_mapping": ({"status": "MAPPED", "job_id": job.id, "canonical_name": job.canonical_name} if job else {"status": "JOB_UNMAPPED"}),
+            # A raw BOSS job is already a valid business value.  The optional
+            # standard-job relation is only for normalized reporting and must
+            # never look like a failed candidate synchronization.
+            "job_mapping": (
+                {"status": "MAPPED", "job_id": job.id, "canonical_name": job.canonical_name}
+                if job
+                else {
+                    "status": "RAW",
+                    "raw_name": source.raw_job_name if source else (matches[0].get("job_name") if matches else None),
+                    "normalization": "OPTIONAL",
+                }
+            ),
             "result_type": result_type,
             "ui": {"severity": severity, "title": title, "message": message},
             "matches": matches,
@@ -775,7 +1094,8 @@ class RecruitmentCollaborationService:
                 "学历": source.candidate_education or "",
                 "BOSS岗位": source.raw_job_name,
                 "标准岗位": job.canonical_name if job else "",
-                "当前招聘者": current_recruiter.display_name if current_recruiter else "",
+                "BOSS账号": account.account_display_name if account else "",
+                "飞书账号": self._recruiter_label(current_recruiter),
                 "状态": source.recruitment_status,
                 "状态依据": source.status_evidence or "",
                 "系统记录标识": source.id,
@@ -785,7 +1105,15 @@ class RecruitmentCollaborationService:
                 "快照状态": source.snapshot_status,
                 "简历附件": [{"file_token": token} for token in (source.resume_tokens_json or [])],
                 "简历状态": source.resume_status,
-                "提醒": ("；".join(f"{item['recruiter_name']}：{item['stage']}" for item in matches) if matches else "暂无其他同事跟进记录"),
+                "提醒": (
+                    "；".join(
+                        f"{item['recruiter_name']}：{item['stage']}"
+                        f"（{item.get('match_reason') or '历史记录'}）"
+                        for item in matches
+                    )
+                    if matches
+                    else "暂无其他同事跟进记录"
+                ),
                 **({"开始聊天时间": int(_epoch(source.conversation_started_at) * 1000)} if source.conversation_started_at else {}),
                 **({"更新时间": int(_epoch(source.conversation_updated_at) * 1000)} if source.conversation_updated_at else {}),
             }
@@ -800,13 +1128,20 @@ class RecruitmentCollaborationService:
         }
         rows = self.session.execute(
             select(CandidateSource, Engagement, RecruitmentJob, Recruiter)
-            .join(Engagement, Engagement.candidate_source_id == CandidateSource.id)
+            .join(RecruitmentAccount, RecruitmentAccount.id == CandidateSource.platform_account_id)
+            .join(Recruiter, Recruiter.id == RecruitmentAccount.recruiter_id)
+            .outerjoin(
+                Engagement,
+                and_(
+                    Engagement.candidate_source_id == CandidateSource.id,
+                    Engagement.recruiter_id == Recruiter.id,
+                ),
+            )
             .outerjoin(RecruitmentJob, RecruitmentJob.id == CandidateSource.job_id)
-            .join(Recruiter, Recruiter.id == Engagement.recruiter_id)
             .where(
                 CandidateSource.company_id == company_id,
                 CandidateSource.id != source.id,
-                Engagement.recruiter_id != actor_id,
+                Recruiter.id != actor_id,
                 CandidateSource.id.not_in(excluded_ids or {""}),
                 or_(
                     CandidateSource.candidate_normalized_name == source.candidate_normalized_name,
@@ -846,11 +1181,13 @@ class RecruitmentCollaborationService:
             else:
                 level, reason = MatchLevel.HISTORICAL_SAME_NAME.value, "仅标准化姓名一致"
             event_types = event_types_by_owner[(other.id, recruiter.id)]
-            interviewed = any(value in {"INTERVIEW_INVITED", "INTERVIEW_COMPLETED"} for value in event_types) or engagement.stage in {
+            stage = engagement.stage if engagement else other.recruitment_status
+            interviewed = any(value in {"INTERVIEW_INVITED", "INTERVIEW_COMPLETED"} for value in event_types) or stage in {
                 "INTERVIEW_INVITED",
                 "INTERVIEW_COMPLETED",
+                "已约面",
             }
-            rejected = "REJECTED" in event_types or engagement.stage == "REJECTED"
+            rejected = "REJECTED" in event_types or stage in {"REJECTED", "已拒绝"}
             result.append(
                 {
                     "match_level": level,
@@ -859,10 +1196,24 @@ class RecruitmentCollaborationService:
                     "recruiter_name": recruiter.display_name,
                     "job_id": other.job_id,
                     "job_name": other.raw_job_name or (other_job.canonical_name if other_job else ""),
-                    "stage": engagement.stage,
+                    "stage": stage,
                     "match_reason": reason,
+                    "first_contact_at": (
+                        engagement.first_contact_at.isoformat()
+                        if engagement and engagement.first_contact_at
+                        else other.conversation_started_at.isoformat()
+                        if other.conversation_started_at
+                        else None
+                    ),
+                    "last_activity_at": (
+                        engagement.last_activity_at.isoformat()
+                        if engagement and engagement.last_activity_at
+                        else other.conversation_updated_at.isoformat()
+                        if other.conversation_updated_at
+                        else None
+                    ),
                     "history": {
-                        "contacted": bool(event_types) or engagement.first_contact_at is not None,
+                        "contacted": bool(event_types) or bool(engagement and engagement.first_contact_at),
                         "interviewed": interviewed,
                         "rejected": rejected,
                         "event_types": event_types,

@@ -55,7 +55,16 @@ API 容器会先执行 Alembic 迁移，健康后三个 Worker 才启动。服�
 ```bash
 python -m pip install --upgrade /home/ubuntu/apps/recruitment-collab/releases/<时间戳>/apps/api
 cd /home/ubuntu/apps/recruitment-collab/releases/<时间戳>
-python -m alembic -c apps/api/alembic.ini upgrade head
+# 迁移必须带上生产 DATABASE_URL，否则 alembic 会静默落在 cwd 的 sqlite 开发库上
+DATABASE_URL=$(grep '^DATABASE_URL=' /home/ubuntu/apps/recruitment-collab/shared/.env | head -1 | cut -d= -f2- | tr -d '"') \
+  python -m alembic -c apps/api/alembic.ini upgrade head
+# 扩展下载只允许从这一处共享发布目录读取。每次部署都必须通过校验脚本
+# 原子更新 ZIP 与元数据，不能把 dist、Downloads 或某个历史 release 当下载源。
+python scripts/publish_extension_release.py \
+  --package artifacts/recruitment-collab-extension.zip \
+  --metadata artifacts/extension-release.json \
+  --target-package /home/ubuntu/apps/recruitment-collab/shared/extension/latest.zip \
+  --target-metadata /home/ubuntu/apps/recruitment-collab/shared/extension/extension-release.json
 ln -sfn /home/ubuntu/apps/recruitment-collab/releases/<时间戳> /home/ubuntu/apps/recruitment-collab/current
 sudo systemctl restart recruitment-collab-api recruitment-collab-candidate-worker recruitment-collab-notification-worker recruitment-collab-retention-worker
 ```
@@ -77,7 +86,7 @@ ssh -N -L 127.0.0.1:8000:127.0.0.1:18082 databoard-server
 - 飞书开放平台 OAuth 回调暂用 `http://localhost:8000/api/v1/auth/feishu/callback`。
 - 只使用测试招聘账号和明确同意用于验收的候选人会话；截图仍只允许聊天区域。
 
-本地真实验收必须依次验证：扩展飞书登录、BOSS 招聘者识别、四项身份查重静默/命中、发送后才建行、状态与时间、同人多岗位、飞书字段同步、最新聊天快照、断网重试、浏览器重启后的隔夜补扫。上述项目通过前，不切换域名、不为其他招聘者分发扩展。
+本地真实验收必须依次验证：扩展飞书登录、BOSS 招聘者识别、四项身份查重静默/命中、点击候选人即建行且不伪造外发事件、状态与时间、同人多岗位、飞书字段同步、最新聊天快照、断网重试、浏览器重启后的账号候选人锚点增量补扫。上述项目通过前，不切换域名、不为其他招聘者分发扩展。
 
 ## 待域名确定后的上线清单
 
@@ -98,12 +107,14 @@ ssh -N -L 127.0.0.1:8000:127.0.0.1:18082 databoard-server
 
 1. 安装相同的 `apps/extension/dist`。
 2. 在“连接设置”填写中央服务器 `https://.../api/v1`；扩展只申请该服务器 Origin 的权限。
-3. 打开 BOSS 沟通页，在扩展中点击“使用飞书登录”。
-4. 飞书 OAuth 验证成功后重新打开扩展，扩展轮询一次性授权并保存设备访问令牌。
-5. 服务端把飞书稳定身份映射到当前 BOSS 招聘账号；此后所有查重、同步、水位和截图请求都验证设备身份。
+3. 招聘人员登录自己负责的 BOSS 账号并打开沟通页，在扩展中点击“使用飞书登录”。未被占用的 BOSS 账号会在首次登录时自动与该飞书成员绑定；一个飞书成员同一时间只能负责一个 BOSS 账号。
+4. 飞书 OAuth 验证成功后重新打开扩展，扩展轮询一次性授权并保存设备访问令牌；每次同步都会核对当前页面 BOSS 姓名和有效绑定。
+5. 如果 BOSS 账号已经属于其他成员，只有管理员能在“BOSS 账号”页从应用可见通讯录选择新负责人。
+
+管理员替换负责人后，旧负责人的全部扩展设备立即撤销；新负责人重新登录扩展即可继承该 BOSS 账号已有的候选人和同步记录。应用可见范围内的普通飞书成员可以登录后台并下载扩展；没有绑定时只能看到安装与绑定引导，不能读取任何候选人数据。成员在未被占用的 BOSS 沟通页使用当前飞书账号登录扩展后会自动完成首次绑定并开始同步；已经属于其他成员的账号不会被扩展抢占，必须由管理员替换。已经授权的扩展暂时离线不会隐藏历史数据，退出或撤销所有扩展授权后会回到待连接状态。管理员可直接查看公司数据。飞书应用需要开通读取通讯录的权限，后台只读取应用可见范围，并且只持久化实际登录或被选择成员的 open_id、user_id 和姓名。
 
 员工离职或设备遗失时，将对应 `PluginDevice` 撤销即可，不需要重新发布扩展。刷新令牌只以哈希形式存入服务器；飞书个人 OAuth Token 仅在回调请求内使用，获取身份后立即丢弃。
 
 ## 数据容量
 
-飞书同步成功后，数据库立即清空同步载荷。候选人缓存超过 30 天且飞书记录存在时会自动去除姓名、年龄、年限、学历等可识别字段。调整期限只需修改环境变量并重启 `data-retention-worker`；不要手工修改生产表。
+飞书同步成功后，数据库立即清空同步载荷。候选人缓存超过 30 天且飞书记录存在时会自动去除姓名、年龄、年限、学历等可识别字段。数据清理 Worker 默认每 30 天执行一次（`RETENTION_RUN_INTERVAL_DAYS=30`），调整清理间隔或保留期限只需修改环境变量并重启 `data-retention-worker`；不要手工修改生产表。

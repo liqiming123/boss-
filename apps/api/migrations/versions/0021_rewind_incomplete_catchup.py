@@ -2,8 +2,8 @@
 
 from datetime import datetime, timedelta, timezone
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "0021_rewind_incomplete_catchup"
 down_revision = "0020_restore_li_admin_role"

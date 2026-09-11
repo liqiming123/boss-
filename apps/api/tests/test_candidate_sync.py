@@ -107,6 +107,65 @@ def test_bitable_updates_datetime_fields_to_include_hours_and_minutes(monkeypatc
     assert all(item["property"]["date_formatter"] == "yyyy/MM/dd HH:mm" for item in updated)
 
 
+def test_bitable_projection_excludes_backend_only_fields(monkeypatch):
+    settings = get_settings().model_copy(
+        update={
+            "feishu_mode": "real",
+            "feishu_app_id": "app",
+            "feishu_app_secret": "secret",
+            "feishu_bitable_app_token": "base",
+            "feishu_bitable_candidate_table_id": "table",
+        }
+    )
+    posted: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "token"})
+        if path.endswith("/fields") and request.method == "GET":
+            items = [
+                {"field_name": name, "field_id": f"field-{index}", "type": field_type, "property": BitableSyncClient.DATETIME_PROPERTY if field_type == 5 else {}}
+                for index, (name, field_type) in enumerate(BitableSyncClient.REQUIRED_FIELDS.items())
+            ]
+            items.extend(
+                {"field_name": name, "field_id": f"internal-{index}", "type": 1, "property": {}}
+                for index, name in enumerate(BitableSyncClient.INTERNAL_FIELDS)
+            )
+            return httpx.Response(200, json={"code": 0, "data": {"items": items, "has_more": False}})
+        if path.endswith("/fields/internal-"):
+            return httpx.Response(200, json={"code": 0, "data": {}})
+        if "/fields/internal-" in path and request.method == "DELETE":
+            return httpx.Response(200, json={"code": 0, "data": {}})
+        if path.endswith("/records") and request.method == "GET":
+            return httpx.Response(200, json={"code": 0, "data": {"items": [], "has_more": False}})
+        if path.endswith("/records") and request.method == "POST":
+            import json
+
+            posted.append(json.loads(request.content)["fields"])
+            return httpx.Response(200, json={"code": 0, "data": {"record": {"record_id": "created"}}})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    real_client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("recruitment_collab.infrastructure.bitable.httpx.Client", lambda **kwargs: real_client)
+    fields = {
+        "候选人": "小明",
+        "BOSS岗位": "运营",
+        "BOSS账号": "李先生",
+        "飞书账号": "李启明",
+        "候选人标识": "opaque-key",
+        "标准岗位": "标准运营",
+        "状态依据": "RECRUITER_OUTBOUND",
+        "系统记录标识": "source-id",
+        "候选人身份签名": "signature",
+        "会话岗位标识": "conversation-key",
+        "快照状态": "READY",
+        "简历状态": "NONE",
+    }
+    assert BitableSyncClient(settings).upsert_candidate(fields) == ("CREATED", "created")
+    assert posted == [{"候选人": "小明", "BOSS岗位": "运营", "BOSS账号": "李先生", "飞书账号": "李启明"}]
+
+
 def test_bitable_renames_legacy_business_fields_without_creating_duplicates(monkeypatch):
     settings = get_settings().model_copy(
         update={
@@ -139,6 +198,7 @@ def test_bitable_renames_legacy_business_fields_without_creating_duplicates(monk
                     {"field_name": "文本", "field_id": "legacy-name", "type": 1, "property": {}},
                     {"field_name": "聊天时间", "field_id": "legacy-time", "type": 5, "property": {"date_formatter": "yyyy/MM/dd"}},
                     {"field_name": "当前对话快照", "field_id": "legacy-snapshot", "type": 17, "property": {}},
+                    {"field_name": "当前招聘者", "field_id": "legacy-recruiter", "type": 1, "property": {}},
                 ]
             )
             return httpx.Response(200, json={"code": 0, "data": {"items": items, "has_more": False}})
@@ -154,7 +214,7 @@ def test_bitable_renames_legacy_business_fields_without_creating_duplicates(monk
     real_client = httpx.Client(transport=httpx.MockTransport(handler))
     monkeypatch.setattr("recruitment_collab.infrastructure.bitable.httpx.Client", lambda **kwargs: real_client)
     BitableSyncClient(settings).upsert_candidate({"候选人标识": "candidate-key"})
-    assert {item["field_name"] for item in updated} == {"候选人", "开始聊天时间", "聊天框截图"}
+    assert {item["field_name"] for item in updated} == {"候选人", "开始聊天时间", "聊天框截图", "飞书账号"}
 
 
 def test_bitable_direct_lookup_only_returns_other_recruiters_system_rows(monkeypatch):
@@ -179,13 +239,13 @@ def test_bitable_direct_lookup_only_returns_other_recruiters_system_rows(monkeyp
                     "data": {
                         "has_more": False,
                         "items": [
-                            {"record_id": "manual", "fields": {"候选人身份签名": "sig", "当前招聘者": "甲"}},
-                            {"record_id": "self", "fields": {"系统记录标识": "source-self", "候选人身份签名": "sig", "当前招聘者": "当前"}},
+                            {"record_id": "manual", "fields": {"候选人身份签名": "sig", "飞书账号": "甲"}},
+                            {"record_id": "self", "fields": {"系统记录标识": "source-self", "候选人身份签名": "sig", "飞书账号": "当前"}},
                             {
                                 "record_id": "other",
-                                "fields": {"系统记录标识": "source-other", "候选人身份签名": "sig", "当前招聘者": "甲", "BOSS岗位": "总助", "状态": "已约面"},
+                                "fields": {"系统记录标识": "source-other", "候选人身份签名": "sig", "飞书账号": "甲", "BOSS岗位": "总助", "状态": "已约面"},
                             },
-                            {"record_id": "different", "fields": {"系统记录标识": "source-different", "候选人身份签名": "other-sig", "当前招聘者": "乙"}},
+                            {"record_id": "different", "fields": {"系统记录标识": "source-different", "候选人身份签名": "other-sig", "飞书账号": "乙"}},
                         ],
                     },
                 },
@@ -195,7 +255,37 @@ def test_bitable_direct_lookup_only_returns_other_recruiters_system_rows(monkeyp
     real_client = httpx.Client(transport=httpx.MockTransport(handler))
     monkeypatch.setattr("recruitment_collab.infrastructure.bitable.httpx.Client", lambda **kwargs: real_client)
     rows = BitableSyncClient(settings).find_system_candidates("sig", "当前")
-    assert [(row["record_id"], row["当前招聘者"]) for row in rows] == [("other", "甲")]
+    assert [(row["record_id"], row["飞书账号"]) for row in rows] == [("other", "甲")]
+
+
+def test_bitable_snapshot_resolves_wiki_alias_before_media_upload(monkeypatch):
+    settings = get_settings().model_copy(
+        update={
+            "feishu_mode": "real",
+            "feishu_app_id": "app",
+            "feishu_app_secret": "secret",
+            "feishu_bitable_app_token": "wiki-node-token",
+            "feishu_bitable_candidate_table_id": "table",
+        }
+    )
+    uploaded_parent_nodes: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "token"})
+        if request.url.path.endswith("/bitable/v1/apps/wiki-node-token"):
+            return httpx.Response(200, json={"code": 0, "data": {"app": {"app_token": "canonical-base-token"}}})
+        if request.url.path.endswith("/drive/v1/medias/upload_all"):
+            body = request.content.decode("latin-1")
+            uploaded_parent_nodes.append("canonical-base-token" if "canonical-base-token" in body else "")
+            return httpx.Response(200, json={"code": 0, "data": {"file_token": "file-token"}})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    real_client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("recruitment_collab.infrastructure.bitable.httpx.Client", lambda **kwargs: real_client)
+    client = BitableSyncClient(settings)
+    assert client.upload_snapshot("chat.jpg", b"jpeg") == "file-token"
+    assert uploaded_parent_nodes == ["canonical-base-token"]
 
 
 def test_mock_worker_marks_queued_candidate_as_sent(client, session, monkeypatch):

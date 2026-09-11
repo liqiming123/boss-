@@ -9,6 +9,7 @@
 body {
   margin: 0;
 }
+.resource-toolbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; }
 .shell {
   min-height: 100vh;
 }
@@ -334,6 +335,18 @@ body {
   font-size: 11px;
   padding: 2px 4px 20px;
 }
+.extension-release-card { margin: 18px 0; }
+.workspace-page { max-width: 1280px; margin: 0 auto; }
+.summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+.summary-card { background: #fff; border: 1px solid #e4e7ec; border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 8px; }
+.summary-card span { color: #667085; font-size: 13px; }
+.summary-card strong { color: #101828; font-size: 28px; }
+.validation-box, .reset-preview { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin: 16px 0; padding: 14px; background: #f8fafc; border-radius: 10px; }
+.danger-card { border-color: #fecdca; }
+@media (max-width: 900px) { .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.extension-release-meta { display: flex; gap: 18px; flex-wrap: wrap; color: #667085; font-size: 12px; margin: 12px 0 16px; }
+.extension-release-meta code { color: #475467; }
+.install-steps { line-height: 2; padding-left: 22px; }
 @media (max-width: 1100px) {
   .ops-metrics {
     grid-template-columns: repeat(3, 1fr);
@@ -343,14 +356,16 @@ body {
   }
 }
 @media (max-width: 760px) {
-  .el-aside {
-    display: none;
-  }
   .el-main {
     padding: 12px;
   }
   .ops-hero {
     align-items: flex-start;
+    gap: 12px;
+  }
+  .page-heading {
+    align-items: flex-start;
+    flex-direction: column;
     gap: 12px;
   }
   .ops-metrics {

@@ -12,6 +12,7 @@ import {
   uploadSnapshotPayload,
 } from "./snapshot-upload-queue";
 import { uploadResumeFromUrl, uploadResumeScreenshot } from "./resume-upload";
+import { dailyMessage, scheduleCompanyDaily, runMissedCompanyDaily, startCompanyDaily, DAILY_ALARM, RETRY_ALARM, DAILY_TEST_ALARM } from "./company-daily";
 
 const allowed = new Set([
   "GET_AUTH",
@@ -21,6 +22,7 @@ const allowed = new Set([
   "MESSAGE_SENT",
   "SYNC_CONVERSATION",
   "GET_SCAN_CHECKPOINT",
+  "GET_CONVERSATION_INDEX",
   "GET_PLUGIN_SETTINGS",
   "PUT_SCAN_CHECKPOINT",
   "CAPTURE_VISIBLE_TAB",
@@ -30,6 +32,7 @@ const allowed = new Set([
   "UPLOAD_RESUME_SCREENSHOT",
   "RECORD_EVENT",
   "SEND_DIAGNOSTIC",
+  "DAILY_CHECK", "DAILY_TIMER_TEST", "DAILY_REAL_CLICK", "DAILY_JOB", "DAILY_BATCH", "DAILY_FINISH", "DAILY_FAILED",
 ]);
 const routes: Record<string, string> = {
   CHECK_CONTEXT: "/plugin/context/check",
@@ -41,7 +44,7 @@ const routes: Record<string, string> = {
   REPORT_SNAPSHOT_STATUS: "/plugin/conversations/snapshot-status",
 };
 
-async function handle(message: unknown): Promise<unknown> {
+async function handle(message: unknown, sender?: chrome.runtime.MessageSender): Promise<unknown> {
   if (
     !message ||
     typeof message !== "object" ||
@@ -50,6 +53,13 @@ async function handle(message: unknown): Promise<unknown> {
   )
     throw new Error("MESSAGE_NOT_ALLOWED");
   const m = message as { type: string; payload?: unknown };
+  if (m.type === "DAILY_CHECK") { void startCompanyDaily((m.payload as any)?.refresh === true); return { ok: true }; }
+  if (m.type === "DAILY_TIMER_TEST") {
+    await chrome.alarms.create(DAILY_TEST_ALARM, { delayInMinutes: 1 });
+    await chrome.storage.local.set({ companyDailyStatus: { status: "定时测试已安排，1 分钟后自动同步", updatedAt: Date.now() } });
+    return { ok: true };
+  }
+  if (m.type.startsWith("DAILY_")) return dailyMessage(m.type, m.payload, sender || {});
   if (m.type === "GET_AUTH") return getAuth();
   if (m.type === "GET_BOUND_ACCOUNT") return apiRequest<{ display_name: string }>("/plugin/me");
   if (m.type === "SET_AUTH") {
@@ -57,10 +67,17 @@ async function handle(message: unknown): Promise<unknown> {
     void flushMessageQueue();
     return { ok: true };
   }
+  if (!(await getAuth()).accessToken) throw new Error("EXTENSION_LOGGED_OUT");
   if (m.type === "GET_SCAN_CHECKPOINT") {
     const p = m.payload as { account_display_name: string; platform?: string };
     return apiRequest(
       `/plugin/conversations/checkpoint?account_display_name=${encodeURIComponent(p.account_display_name)}&platform=${encodeURIComponent(p.platform ?? "boss")}`,
+    );
+  }
+  if (m.type === "GET_CONVERSATION_INDEX") {
+    const p = m.payload as { account_display_name: string; platform?: string };
+    return apiRequest(
+      `/plugin/conversations/index?account_display_name=${encodeURIComponent(p.account_display_name)}&platform=${encodeURIComponent(p.platform ?? "boss")}`,
     );
   }
   if (m.type === "GET_PLUGIN_SETTINGS") {
@@ -68,13 +85,34 @@ async function handle(message: unknown): Promise<unknown> {
     await setAuth({ catchupEnabled: settings.catchup_enabled });
     return settings;
   }
-  if (m.type === "CAPTURE_VISIBLE_TAB")
-    return {
-      dataUrl: await chrome.tabs.captureVisibleTab(
-        chrome.windows.WINDOW_ID_CURRENT,
-        { format: "png" },
-      ),
-    };
+  if (m.type === "CAPTURE_VISIBLE_TAB") {
+    // Use CDP so historical screenshots work while the user views Feishu,
+    // without activating the BOSS tab and causing visible flicker.
+    const targetTabId = sender?.tab?.id;
+    if (targetTabId == null)
+      throw new Error("SCREENSHOT_SOURCE_TAB_UNAVAILABLE");
+    const target = { tabId: targetTabId };
+    await chrome.debugger.attach(target, "1.3");
+    try {
+      await chrome.debugger.sendCommand(target, "Page.enable");
+      // Chrome now rejects Page.captureScreenshot requests with
+      // `fromSurface: false` ("Only screenshots from surface are allowed.").
+      // Always use the compositor surface path.  The request remains scoped
+      // to the BOSS tab supplied by the content-script and never captures the
+      // surrounding browser UI.
+      const result = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+        format: "png",
+        fromSurface: true,
+        captureBeyondViewport: false,
+      }) as { data?: string };
+      if (!result.data) throw new Error("SCREENSHOT_CAPTURE_FAILED");
+      return {
+        dataUrl: `data:image/png;base64,${result.data}`,
+      };
+    } finally {
+      await chrome.debugger.detach(target).catch(() => undefined);
+    }
+  }
   if (m.type === "UPLOAD_SNAPSHOT") {
     const p = m.payload as {
       candidateSourceIds: string[];
@@ -118,7 +156,7 @@ async function handle(message: unknown): Promise<unknown> {
 
 chrome.runtime.onMessage.addListener(
   (message: unknown, _sender, sendResponse) => {
-    void handle(message)
+    void handle(message, _sender)
       .then((data) => sendResponse({ ok: true, data }))
       .catch((error) =>
         sendResponse({
@@ -130,8 +168,15 @@ chrome.runtime.onMessage.addListener(
   },
 );
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === DAILY_ALARM) {
+    void startCompanyDaily(false, true);
+  }
+  if (alarm.name === RETRY_ALARM) void runMissedCompanyDaily();
+  if (alarm.name === DAILY_TEST_ALARM) void startCompanyDaily(false, true);
   if (alarm.name === "recruitment-message-retry") void flushMessageQueue();
   if (alarm.name === "recruitment-snapshot-retry") void flushSnapshotQueue();
 });
 void flushMessageQueue();
 void flushSnapshotQueue();
+void scheduleCompanyDaily();
+void runMissedCompanyDaily();

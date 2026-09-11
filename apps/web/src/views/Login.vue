@@ -19,7 +19,7 @@ async function submit() {
     <div class="login-card">
       <div class="login-mark">RC</div>
       <h2>招聘协同运维台</h2>
-      <p>仅开发与系统管理员使用</p>
+      <p>公司招聘协同管理后台</p>
       <el-button
         type="primary"
         :loading="loading"

@@ -44,9 +44,20 @@ export interface AdapterDiagnostics {
   errorCodes: string[];
   sanitizedContext: Record<string, string | number | boolean>;
 }
+export interface InterviewDetails {
+  interview_type?: "ONLINE" | "OFFLINE";
+  /** ISO-8601 with the +08:00 offset; only set when BOSS showed both a date and
+   * a start time. */
+  scheduled_at?: string;
+  location?: string;
+}
 export interface RecruiterMessageSent {
   sentAt: string;
   evidence: "DELIVERY_MARKER" | "OUTGOING_TEXT";
+  messageText?: string;
+  statusEvidence?: StatusEvidence;
+  /** Interview scheduler details, present only for a confirmed invitation. */
+  interview?: InterviewDetails;
 }
 export interface ResumePreviewOpened {
   url?: string;

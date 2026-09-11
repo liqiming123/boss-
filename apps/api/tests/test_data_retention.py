@@ -33,6 +33,57 @@ def test_synced_candidate_cache_is_minimized_but_operational_keys_remain(client,
     assert minimized.data_minimized_at is not None
 
 
+def test_stale_unsynced_candidate_is_minimized_after_sync_reaches_terminal_state(client, session, monkeypatch):
+    from test_api_flow import context, message_sent
+
+    source_id = message_sent(client, {}, context("未同步但已失败候选人", "谢女士", "unsynced-retention")).json()["candidate_source_id"]
+    source = session.get(CandidateSource, source_id)
+    source.last_seen_at = now() - timedelta(days=31)
+    outbox = session.scalar(select(CandidateSyncOutbox).where(CandidateSyncOutbox.candidate_source_id == source_id))
+    outbox.status = "FAILED"
+    outbox.updated_at = now()
+    session.commit()
+    factory = sessionmaker(bind=session.bind, expire_on_commit=False)
+    monkeypatch.setattr(data_retention_worker, "SessionLocal", factory)
+    monkeypatch.setattr(
+        data_retention_worker,
+        "get_settings",
+        lambda: get_settings().model_copy(update={"candidate_cache_days": 30, "failed_task_retention_days": 60}),
+    )
+    result = data_retention_worker.process_retention()
+    session.expire_all()
+    minimized = session.get(CandidateSource, source_id)
+    outbox = session.get(CandidateSyncOutbox, outbox.id)
+    assert result["candidates_minimized"] == 1
+    assert minimized is not None
+    assert minimized.candidate_display_name == "已按保留期限最小化"
+    assert minimized.feishu_record_id is None
+    assert minimized.candidate_age is None
+    assert minimized.data_minimized_at is not None
+    # The failed payload remains available during the independent retry
+    # retention window, so an administrator can still retry the terminal task.
+    assert outbox.payload_json
+
+
+def test_active_unsynced_candidate_is_kept_for_worker_retry(client, session, monkeypatch):
+    from test_api_flow import context, message_sent
+
+    source_id = message_sent(client, {}, context("等待同步候选人", "谢女士", "pending-retention")).json()["candidate_source_id"]
+    source = session.get(CandidateSource, source_id)
+    source.last_seen_at = now() - timedelta(days=31)
+    session.commit()
+    factory = sessionmaker(bind=session.bind, expire_on_commit=False)
+    monkeypatch.setattr(data_retention_worker, "SessionLocal", factory)
+    monkeypatch.setattr(data_retention_worker, "get_settings", lambda: get_settings().model_copy(update={"candidate_cache_days": 30}))
+    result = data_retention_worker.process_retention()
+    session.expire_all()
+    kept = session.get(CandidateSource, source_id)
+    assert result["candidates_minimized"] == 0
+    assert kept is not None
+    assert kept.candidate_display_name == "等待同步候选人"
+    assert kept.data_minimized_at is None
+
+
 def test_failed_candidate_sync_payload_is_cleared_after_retention(client, session, monkeypatch):
     from test_api_flow import context, message_sent
 

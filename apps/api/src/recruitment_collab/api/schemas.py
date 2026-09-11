@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, EmailStr, Field, HttpUrl
+from pydantic import BaseModel, EmailStr, Field, HttpUrl, field_validator
 
 
 class DevLoginRequest(BaseModel):
@@ -37,17 +37,61 @@ class ContextResolveRequest(BaseModel):
     extractor_version: str = Field(min_length=1, max_length=80)
 
 
+class InterviewDetails(BaseModel):
+    """What the plugin could read from BOSS's interview scheduler.
+
+    Every field is optional and every validator is lenient: an unreadable or
+    unexpected scheduler value is dropped instead of rejected. The interview
+    schedule is a bonus, while the 已约面 status is the business fact — a bad
+    date must never turn the whole message-sent request into a 422 and lose the
+    invitation.
+    """
+
+    interview_type: Optional[Literal["ONLINE", "OFFLINE"]] = None
+    scheduled_at: Optional[datetime] = None
+    location: Optional[str] = None
+
+    @field_validator("interview_type", mode="before")
+    @classmethod
+    def _known_format(cls, value: object) -> object:
+        if value is None:
+            return None
+        text = str(value).strip().upper()
+        return text if text in {"ONLINE", "OFFLINE"} else None
+
+    @field_validator("scheduled_at", mode="before")
+    @classmethod
+    def _lenient_datetime(cls, value: object) -> object:
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            return value
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @field_validator("location", mode="before")
+    @classmethod
+    def _bounded_location(cls, value: object) -> object:
+        if value is None:
+            return None
+        text = str(value).strip()[:300]
+        return text or None
+
+
 class MessageSentRequest(ContextResolveRequest):
     sent_at: datetime
     recruitment_status: str = Field(default="沟通中", max_length=30)
     status_evidence: Optional[str] = Field(default=None, max_length=200)
     status_rule_version: str = Field(default="boss-status-v1", max_length=20)
     resume_status: Optional[str] = Field(default=None, max_length=30)
+    interview: Optional[InterviewDetails] = None
 
 
 class ConversationSyncRequest(MessageSentRequest):
     has_recruiter_outbound: bool
-    sync_reason: str = Field(default="CATCHUP", pattern=r"^(MESSAGE_SENT|CATCHUP|CONVERSATION_UPDATED)$")
+    sync_reason: str = Field(default="CATCHUP", pattern=r"^(MESSAGE_SENT|CATCHUP|CONVERSATION_UPDATED|CANDIDATE_OPENED)$")
 
 
 class ScanCheckpointRequest(BaseModel):
@@ -113,6 +157,19 @@ class RecruitmentSettingsUpdate(BaseModel):
     catchup_enabled: Optional[bool] = None
 
 
+class FeishuTableValidateRequest(BaseModel):
+    table_url: str = Field(min_length=12, max_length=500)
+
+
+class FeishuTableActivateRequest(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=200)
+
+
+class SystemResetRequest(BaseModel):
+    preview_version: str = Field(min_length=16, max_length=64)
+    confirmation: str = Field(min_length=1, max_length=80)
+
+
 class JobCreate(BaseModel):
     code: str = Field(min_length=2, max_length=50)
     canonical_name: str = Field(min_length=1, max_length=120)
@@ -131,6 +188,19 @@ class AccountCreate(BaseModel):
     platform: str = "boss"
     platform_account_key: str
     account_display_name: str
+
+
+class BossAccountAssignmentRequest(BaseModel):
+    feishu_open_id: str = Field(min_length=1, max_length=100)
+    feishu_user_id: Optional[str] = Field(default=None, max_length=100)
+    feishu_display_name: str = Field(min_length=1, max_length=100)
+    expected_version: Optional[int] = Field(default=None, ge=1)
+
+
+class AdminGrantRequest(BaseModel):
+    feishu_open_id: str = Field(min_length=1, max_length=100)
+    feishu_user_id: Optional[str] = Field(default=None, max_length=100)
+    feishu_display_name: str = Field(min_length=1, max_length=100)
 
 
 class AliasCreate(BaseModel):

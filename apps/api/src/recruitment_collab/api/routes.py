@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -9,9 +10,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import jwt
 from fastapi import APIRouter, Depends, File, Form, Header, Query, Response, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import func, select
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -22,34 +25,43 @@ from recruitment_collab.infrastructure.database import get_db
 from recruitment_collab.infrastructure.feishu import FeishuCallbackVerifier, FeishuIdentity, FeishuOAuthClient
 from recruitment_collab.infrastructure.models import (
     AuditLog,
+    BossAccountAssignment,
+    BossDailyMetric,
     CandidateSource,
     CandidateSyncOutbox,
     Conflict,
+    ConflictExclusion,
     ConversationScanCheckpoint,
     DuplicateLookupAlert,
     Engagement,
     FeishuBindingAttempt,
+    FeishuBitableConfig,
     Interview,
     JobAlias,
     MockFeishuMessage,
+    Notification,
     NotificationOutbox,
     PluginDevice,
     PluginDiagnostic,
     Recruiter,
+    RecruiterAccessProfile,
     RecruitmentAccount,
     RecruitmentEvent,
     RecruitmentJob,
     RecruitmentSetting,
+    SystemResetJob,
     UnmappedJob,
     WorkerHeartbeat,
     now,
 )
 from recruitment_collab.infrastructure.security import decode_token, hash_password, hash_token, make_token, verify_password
 
-from .dependencies import ADMIN_ROLES, ADMIN_SESSION_COOKIE, Actor, bootstrap_company_id, current_actor, plugin_actor, require_admin
+from .dependencies import ADMIN_SESSION_COOKIE, Actor, bootstrap_company_id, current_actor, plugin_actor, require_admin, workspace_state
 from .schemas import (
     AccountCreate,
+    AdminGrantRequest,
     AliasCreate,
+    BossAccountAssignmentRequest,
     ContextResolveRequest,
     ConversationSyncRequest,
     DevLoginRequest,
@@ -57,6 +69,8 @@ from .schemas import (
     EventRequest,
     FeishuBindingStartRequest,
     FeishuDevicePollRequest,
+    FeishuTableActivateRequest,
+    FeishuTableValidateRequest,
     InterviewRequest,
     JobCreate,
     MessageSentRequest,
@@ -65,9 +79,11 @@ from .schemas import (
     RecruitmentSettingsUpdate,
     ScanCheckpointRequest,
     SnapshotStatusRequest,
+    SystemResetRequest,
 )
 
 router = APIRouter(prefix="/api/v1")
+HISTORICAL_RESCAN_WATERMARK = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 ADMIN_RESOURCES = {
     "recruiters": Recruiter,
@@ -87,8 +103,35 @@ ADMIN_RESOURCES = {
     "binding-attempts": FeishuBindingAttempt,
     "audit-logs": AuditLog,
     "plugin-diagnostics": PluginDiagnostic,
+    "boss-daily-metrics": BossDailyMetric,
 }
+ADMIN_EDITABLE_FIELDS = {
+    # Role changes use the dedicated administrator grant/revoke APIs so role,
+    # data scope and capabilities cannot drift apart.
+    "recruiters": {"display_name", "email", "status", "password"},
+    "accounts": {"recruiter_id", "platform", "platform_account_key", "account_display_name", "status"},
+    "jobs": {"code", "canonical_name", "category", "status"},
+    "candidate-sources": {"candidate_display_name", "candidate_age", "candidate_experience", "candidate_education", "recruitment_status", "status_evidence", "resume_status"},
+    "interviews": {"scheduled_at", "duration_minutes", "location_type", "location_text", "status", "result", "notes", "job_id", "recruiter_id"},
+}
+ADMIN_DELETABLE_RESOURCES = {"accounts", "jobs", "job-aliases", "unmapped-jobs"}
 SENSITIVE_COLUMNS = {"password_hash", "refresh_token_hash"}
+# Technical identifiers and attachment/provider payloads are intentionally not
+# sent to the browser. They are only needed by workers or privileged detail
+# endpoints and must not become a general-purpose admin data export.
+ADMIN_HIDDEN_COLUMNS = {
+    "snapshot_tokens_json", "resume_tokens_json", "candidate_identity_signature",
+    "conversation_job_key", "platform_candidate_id", "page_url_hash",
+    "payload_json", "app_token", "candidate_table_id", "validation_json",
+    "device_poll_token_hash", "state_hash",
+}
+
+
+def admin_serialize(row: Any) -> dict[str, Any]:
+    data = serialize(row)
+    for column in SENSITIVE_COLUMNS | ADMIN_HIDDEN_COLUMNS:
+        data.pop(column, None)
+    return data
 EXPECTED_WORKERS = {
     "candidate-sync-worker": "飞书候选人同步",
     "notification-worker": "飞书通知",
@@ -187,24 +230,50 @@ def _queue_alerts(
     return alerts, values
 
 
-def _operation_bindings(db: Session, company_id: str) -> list[dict[str, Any]]:
-    source_count_rows = db.execute(
+def _operation_bindings(db: Session, company_id: str, recruiter_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    source_statement = (
         select(RecruitmentAccount.recruiter_id, func.count(CandidateSource.id))
         .join(CandidateSource, CandidateSource.platform_account_id == RecruitmentAccount.id)
         .where(RecruitmentAccount.company_id == company_id)
         .group_by(RecruitmentAccount.recruiter_id)
-    ).all()
+    )
+    # "Bound" now means the administrator has assigned a BOSS account to this
+    # Feishu member, not merely that the member logged in with Feishu.  Every
+    # person in the app's contact scope gets a Feishu identity at web login,
+    # so identity presence alone would mark the pending-assignment state as
+    # bound and mislead both dashboards.
+    assignments_by_recruiter: dict[str, int] = defaultdict(int)
+    assignment_statement = (
+        select(BossAccountAssignment.feishu_recruiter_id, func.count())
+        .where(
+            BossAccountAssignment.company_id == company_id,
+            BossAccountAssignment.status == "ACTIVE",
+            BossAccountAssignment.feishu_recruiter_id.is_not(None),
+        )
+        .group_by(BossAccountAssignment.feishu_recruiter_id)
+    )
+    if recruiter_ids:
+        assignment_statement = assignment_statement.where(BossAccountAssignment.feishu_recruiter_id.in_(recruiter_ids))
+    for recruiter_id, count in db.execute(assignment_statement).all():
+        assignments_by_recruiter[recruiter_id] = int(count)
+    if recruiter_ids:
+        source_statement = source_statement.where(RecruitmentAccount.recruiter_id.in_(recruiter_ids))
+    source_count_rows = db.execute(source_statement).all()
     source_counts: dict[str, int] = {recruiter_id: int(count) for recruiter_id, count in source_count_rows}
     devices_by_recruiter: dict[str, list[PluginDevice]] = defaultdict(list)
-    for device in db.scalars(select(PluginDevice).where(PluginDevice.company_id == company_id).order_by(PluginDevice.updated_at.desc())).all():
+    device_statement = select(PluginDevice).where(PluginDevice.company_id == company_id).order_by(PluginDevice.updated_at.desc())
+    if recruiter_ids:
+        device_statement = device_statement.where(PluginDevice.recruiter_id.in_(recruiter_ids))
+    for device in db.scalars(device_statement).all():
         devices_by_recruiter[device.recruiter_id].append(device)
     accounts_by_recruiter: dict[str, list[RecruitmentAccount]] = defaultdict(list)
-    for account in db.scalars(
-        select(RecruitmentAccount).where(
-            RecruitmentAccount.company_id == company_id,
-            RecruitmentAccount.status == "ACTIVE",
-        )
-    ).all():
+    account_statement = select(RecruitmentAccount).where(
+        RecruitmentAccount.company_id == company_id,
+        RecruitmentAccount.status == "ACTIVE",
+    )
+    if recruiter_ids:
+        account_statement = account_statement.where(RecruitmentAccount.recruiter_id.in_(recruiter_ids))
+    for account in db.scalars(account_statement).all():
         accounts_by_recruiter[account.recruiter_id].append(account)
     checkpoints_by_account: dict[str, list[ConversationScanCheckpoint]] = defaultdict(list)
     for checkpoint in db.scalars(select(ConversationScanCheckpoint).where(ConversationScanCheckpoint.company_id == company_id)).all():
@@ -212,9 +281,16 @@ def _operation_bindings(db: Session, company_id: str) -> list[dict[str, Any]]:
 
     bindings: list[dict[str, Any]] = []
     recruiters = db.scalars(select(Recruiter).where(Recruiter.company_id == company_id).order_by(Recruiter.display_name)).all()
+    if recruiter_ids:
+        recruiters = [recruiter for recruiter in recruiters if recruiter.id in recruiter_ids]
     for recruiter in recruiters:
         devices = devices_by_recruiter[recruiter.id]
         accounts = accounts_by_recruiter[recruiter.id]
+        # In the personal console view a Feishu member without any BOSS
+        # account is in the pending-assignment state: show the empty state
+        # instead of a fake binding named after the member themselves.
+        if recruiter_ids and not accounts:
+            continue
         account_names = list(dict.fromkeys(account.account_display_name for account in accounts)) or [recruiter.display_name]
         checkpoints = [checkpoint for name in account_names for checkpoint in checkpoints_by_account[name]]
         bindings.append(
@@ -222,9 +298,13 @@ def _operation_bindings(db: Session, company_id: str) -> list[dict[str, Any]]:
                 "recruiter_id": recruiter.id,
                 "boss_accounts": account_names,
                 "role": recruiter.role,
-                "bound": bool(recruiter.feishu_open_id),
+                "bound": assignments_by_recruiter[recruiter.id] > 0,
                 "feishu_display_name": recruiter.feishu_display_name,
-                "active_device_count": sum(device.status == "ACTIVE" for device in devices),
+                # A revoked/deleted device is never active; stale credentials
+                # are excluded so this reflects extensions seen recently.
+                "active_device_count": sum(
+                device.status == "ACTIVE" and _aware_utc(device.last_seen_at) >= now() - timedelta(minutes=15) for device in devices
+                ),
                 "source_count": int(source_counts.get(recruiter.id, 0)),
                 "last_checkpoint_at": max((item.completed_through_at for item in checkpoints), default=None),
                 "devices": [
@@ -289,6 +369,37 @@ def _recent_diagnostics(db: Session, company_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def _recent_outbox_failures_for_actor(db: Session, actor: Actor) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for kind, model, condition in (
+        ("candidate_sync", CandidateSyncOutbox, CandidateSyncOutbox.candidate_source_id.in_(select(CandidateSource.id).where(CandidateSource.platform_account_id.in_(_company_account_ids(db, actor))))),
+        ("notification", NotificationOutbox, NotificationOutbox.recipient_recruiter_id == actor.id),
+    ):
+        rows = db.scalars(select(model).where(model.company_id == actor.company_id, condition, model.status.in_({"FAILED", "PENDING"})).order_by(model.updated_at.desc()).limit(20)).all()
+        output.extend({"kind": kind, "id": row.id, "status": row.status, "retry_count": row.retry_count, "last_error": row.last_error, "updated_at": row.updated_at} for row in rows)  # type: ignore[attr-defined]
+    return sorted(output, key=lambda item: str(item["updated_at"]), reverse=True)[:20]
+
+
+def _recent_diagnostics_for_actor(db: Session, actor: Actor) -> list[dict[str, Any]]:
+    rows = db.scalars(select(PluginDiagnostic).where(PluginDiagnostic.company_id == actor.company_id, PluginDiagnostic.recruiter_id == actor.id).order_by(PluginDiagnostic.created_at.desc()).limit(20)).all()
+    return [
+        {
+            "id": row.id,
+            "platform": row.platform,
+            "adapter_version": row.adapter_version,
+            "page_type": row.page_type,
+            "account_status": row.account_status,
+            "candidate_status": row.candidate_status,
+            "job_status": row.job_status,
+            "platform_id_status": row.platform_id_status,
+            "created_at": row.created_at,
+            "error_codes": row.error_codes_json,
+            "context": row.sanitized_context_json,
+        }
+        for row in rows
+    ]
+
+
 def _aware_utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
@@ -325,18 +436,25 @@ def _valid_snapshot_image(content: bytes, content_type: str) -> bool:
 def plugin_company_for_account(actor: Actor, account_display_name: str | None, db: Session) -> str:
     if not actor.id or get_settings().is_development:
         return actor.company_id
+    setting = db.scalar(select(RecruitmentSetting).where(RecruitmentSetting.company_id == actor.company_id))
+    if setting and setting.reset_in_progress:
+        raise ApplicationError("SYSTEM_RESET_IN_PROGRESS", "系统正在重新初始化同步，请稍后重新绑定扩展", 503)
     display_name = (account_display_name or "").strip()
     mapped = db.scalar(
         select(RecruitmentAccount.id).where(
             RecruitmentAccount.company_id == actor.company_id,
-            RecruitmentAccount.recruiter_id == actor.id,
             RecruitmentAccount.account_display_name == display_name,
             RecruitmentAccount.status == "ACTIVE",
         )
     )
+    if mapped:
+        assignment = db.scalar(select(BossAccountAssignment).where(BossAccountAssignment.boss_account_id == mapped, BossAccountAssignment.status == "ACTIVE"))
+        if assignment and assignment.feishu_recruiter_id == actor.id:
+            return actor.company_id
+        raise ApplicationError("BOSS_ACCOUNT_FORBIDDEN", "当前飞书账号未被分配这个 BOSS 招聘账号", 403)
     recruiter = db.get(Recruiter, actor.id)
     bound_feishu_name = recruiter.feishu_display_name if recruiter else None
-    if actor.display_name != display_name and display_name != bound_feishu_name and not mapped:
+    if actor.display_name != display_name and display_name != bound_feishu_name:
         raise ApplicationError("BOSS_ACCOUNT_FORBIDDEN", "当前飞书身份未绑定这个 BOSS 招聘账号", 403)
     return actor.company_id
 
@@ -364,8 +482,6 @@ def admin_login(body: DevLoginRequest, db: Session = Depends(get_db)) -> dict[st
     if not get_settings().is_development:
         raise ApplicationError("PASSWORD_LOGIN_DISABLED", "管理后台请使用飞书登录", 404)
     user = _authenticated_user(body, db)
-    if user.role not in ADMIN_ROLES:
-        raise ApplicationError("ADMIN_LOGIN_REQUIRED", "该账号没有开发管理后台权限", 403)
     return _login_tokens(user)
 
 
@@ -417,15 +533,34 @@ def logout(response: Response, _: Actor = Depends(current_actor)) -> dict[str, b
 
 
 @router.get("/auth/me")
-def me(actor: Actor = Depends(current_actor)) -> dict[str, str]:
-    return actor.__dict__
+def me(actor: Actor = Depends(current_actor), db: Session = Depends(get_db)) -> dict[str, Any]:
+    profile = _access_profile(db, actor)
+    assignment_count = db.scalar(
+        select(func.count())
+        .select_from(BossAccountAssignment)
+        .where(BossAccountAssignment.company_id == actor.company_id, BossAccountAssignment.feishu_recruiter_id == actor.id, BossAccountAssignment.status == "ACTIVE")
+    )
+    return {
+        **actor.__dict__,
+        "workspace": workspace_state(db, actor),
+        # Drives the pending-assignment state in the console: a member only
+        # leaves "待分配" once an administrator assigns them a BOSS account.
+        "has_boss_assignment": bool(assignment_count),
+        "capabilities": {
+            "data_scope": profile.data_scope,
+            "can_manage_team": profile.can_manage_team,
+            "can_manage_feishu": profile.can_manage_feishu,
+            "can_manage_jobs": profile.can_manage_jobs,
+            "can_reset_system": profile.can_reset_system,
+        },
+    }
 
 
 @router.get("/plugin/me")
 def plugin_me(actor: Actor = Depends(plugin_actor), db: Session = Depends(get_db)) -> dict[str, str]:
     """Return the bound Feishu display name used as the sync recruiter."""
     recruiter = db.get(Recruiter, actor.id)
-    return {"display_name": recruiter.feishu_display_name if recruiter and recruiter.feishu_display_name else actor.display_name}
+    return {"display_name": recruiter.feishu_display_name if recruiter and recruiter.feishu_display_name else actor.display_name, "role": actor.role}
 
 
 @router.post("/auth/feishu/web/start")
@@ -449,10 +584,26 @@ def feishu_web_login_start(company_id: str = Depends(bootstrap_company_id), db: 
 @router.post("/auth/devices/{device_id}/revoke")
 def revoke_device(device_id: str, actor: Actor = Depends(current_actor), db: Session = Depends(get_db)) -> dict[str, bool]:
     device = db.get(PluginDevice, device_id)
-    if not device or (device.recruiter_id != actor.id and actor.role not in ADMIN_ROLES):
+    if not device or (device.recruiter_id != actor.id and not _access_profile(db, actor).can_manage_team):
         raise ApplicationError("DEVICE_NOT_FOUND", "设备不存在", 404)
     device.status, device.revoked_at = "REVOKED", now()
     db.commit()
+    return {"success": True}
+
+
+@router.post("/plugin/device/logout")
+def plugin_device_logout(actor: Actor = Depends(plugin_actor), authorization: str = Header(default=""), db: Session = Depends(get_db)) -> dict[str, bool]:
+    """Delete the extension device record when the user explicitly logs out."""
+    try:
+        payload = decode_token(authorization[7:] if authorization.startswith("Bearer ") else "", "access")
+    except jwt.PyJWTError as exc:
+        raise ApplicationError("INVALID_TOKEN", "登录已失效", 401) from exc
+    device_id = str(payload.get("device_id") or "").strip()
+    if device_id:
+        device = db.scalar(select(PluginDevice).where(PluginDevice.device_id == device_id, PluginDevice.recruiter_id == actor.id))
+        if device:
+            db.delete(device)
+            db.commit()
     return {"success": True}
 
 
@@ -461,11 +612,12 @@ def feishu_binding_status(
     account_display_name: str = Query(min_length=1, max_length=100), actor: Actor = Depends(plugin_actor), db: Session = Depends(get_db)
 ) -> dict[str, Any]:
     company_id = plugin_company_for_account(actor, account_display_name, db)
-    recruiter = RecruitmentCollaborationService(db).page_recruiter(company_id, account_display_name.strip())
+    account = db.scalar(select(RecruitmentAccount).where(RecruitmentAccount.company_id == company_id, RecruitmentAccount.account_display_name == account_display_name.strip(), RecruitmentAccount.status == "ACTIVE"))
+    assignment = db.scalar(select(BossAccountAssignment).where(BossAccountAssignment.boss_account_id == account.id, BossAccountAssignment.status == "ACTIVE")) if account else None
     return {
         "account_display_name": account_display_name.strip(),
-        "bound": bool(recruiter and recruiter.feishu_open_id),
-        "feishu_display_name": recruiter.feishu_display_name if recruiter and recruiter.feishu_open_id else None,
+        "bound": bool(assignment and (not actor.id or assignment.feishu_recruiter_id == actor.id)),
+        "feishu_display_name": assignment.feishu_display_name if assignment else None,
     }
 
 
@@ -475,9 +627,18 @@ def feishu_binding_start(body: FeishuBindingStartRequest, company_id: str = Depe
     if settings.feishu_mode != "real":
         raise ApplicationError("FEISHU_BINDING_UNAVAILABLE", "当前未启用真实飞书模式", 503)
     display_name = body.account_display_name.strip()
-    recruiter = RecruitmentCollaborationService(db).page_recruiter(company_id, display_name)
-    if body.action == "unbind" and (not recruiter or not recruiter.feishu_open_id):
-        raise ApplicationError("FEISHU_NOT_BOUND", "当前 BOSS 招聘人员尚未绑定飞书", 409)
+    # A first-time extension bind may legitimately be the first place where
+    # this BOSS account is seen.  The actual identity binding still happens
+    # only after the user completes Feishu OAuth in _complete_boss_binding;
+    # creating the placeholder here avoids rejecting new Windows accounts
+    # before they can authenticate.
+    recruiter = RecruitmentCollaborationService(db).page_recruiter(
+        company_id, display_name, create=body.action == "bind"
+    )
+    if get_settings().app_env == "production" and body.action == "bind" and not body.device_id:
+        raise ApplicationError("DEVICE_ID_REQUIRED", "绑定扩展必须提供浏览器设备标识", 400)
+    if body.action == "unbind" and not recruiter:
+        raise ApplicationError("FEISHU_NOT_BOUND", "当前 BOSS 招聘账号尚未分配负责人", 409)
     state = secrets.token_urlsafe(32)
     poll_token = secrets.token_urlsafe(32) if body.device_id and body.action == "bind" else None
     attempt = FeishuBindingAttempt(
@@ -501,6 +662,33 @@ def feishu_binding_start(body: FeishuBindingStartRequest, company_id: str = Depe
     }
 
 
+@router.post("/plugin/company-daily-data/login/start")
+def company_daily_login_start(body: FeishuBindingStartRequest, company_id: str = Depends(bootstrap_company_id), db: Session = Depends(get_db)) -> dict[str, Any]:
+    from recruitment_collab.infrastructure.models import BossCompanyDailyConfig
+    config = db.scalar(select(BossCompanyDailyConfig).where(BossCompanyDailyConfig.company_id == company_id, BossCompanyDailyConfig.enabled.is_(True)))
+    if not config or config.collector_name != body.account_display_name.strip() or not body.device_id:
+        raise ApplicationError("DAILY_COLLECTOR_REQUIRED", "请先打开已配置的公司日报管理员 BOSS 沟通页", 403)
+    if get_settings().feishu_mode != "real":
+        raise ApplicationError("FEISHU_BINDING_UNAVAILABLE", "当前未启用真实飞书模式", 503)
+    state, poll_token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    attempt = FeishuBindingAttempt(company_id=company_id, account_display_name=config.collector_name,
+        action="company_daily_login", state_hash=hash_token(state), expires_at=now() + timedelta(minutes=10),
+        device_id=body.device_id, device_name=body.device_name, device_poll_token_hash=hash_token(poll_token))
+    db.add(attempt)
+    db.commit()
+    return {"authorization_url": FeishuOAuthClient(get_settings()).authorization_url(state), "attempt_id": attempt.id, "poll_token": poll_token, "expires_in": 600}
+
+
+def _complete_company_daily_login(db: Session, attempt: FeishuBindingAttempt, identity: FeishuIdentity) -> HTMLResponse:
+    recruiter = db.scalar(select(Recruiter).where(Recruiter.company_id == attempt.company_id, Recruiter.feishu_open_id == identity.open_id, Recruiter.status == "ACTIVE", Recruiter.role == "ADMIN"))
+    if not recruiter:
+        raise ApplicationError("DAILY_ADMIN_REQUIRED", "公司日报专用登录仅限本系统管理员；不会自动提升权限或更换 BOSS 负责人", 403)
+    attempt.recruiter_id, attempt.status = recruiter.id, "APPROVED"
+    db.add(AuditLog(company_id=attempt.company_id, actor_id=recruiter.id, action="COMPANY_DAILY_DEVICE_APPROVED", entity_type="PluginDevice", entity_id=attempt.device_id, after_json={"collector": attempt.account_display_name}))
+    db.commit()
+    return HTMLResponse("<!doctype html><meta charset='utf-8'><title>公司日报授权成功</title><h2>公司日报授权成功</h2><p>现有 BOSS 负责人和候选人归属未改变。请回到扩展查看同步状态。</p>")
+
+
 def _disconnect_recruiter_feishu(db: Session, recruiter: Recruiter) -> None:
     """Remove a Feishu identity and invalidate every extension session it owned."""
     disconnected_at = now()
@@ -521,11 +709,18 @@ def _disconnect_recruiter_feishu(db: Session, recruiter: Recruiter) -> None:
 async def feishu_callback(code: str = Query(...), state: str = Query(...), db: Session = Depends(get_db)) -> Response:
     attempt = _pending_binding_attempt(db, state)
     identity = await FeishuOAuthClient(get_settings()).exchange_code(code)
+    if attempt.action == "company_daily_login":
+        return _complete_company_daily_login(db, attempt, identity)
     return _complete_web_login(db, attempt, identity) if attempt.action == "web_login" else _complete_boss_binding(db, attempt, identity)
 
 
 def _pending_binding_attempt(db: Session, state: str) -> FeishuBindingAttempt:
-    attempt = db.scalar(select(FeishuBindingAttempt).where(FeishuBindingAttempt.state_hash == hash_token(state)))
+    # Serialize callback consumption. Without a row lock two browser retries
+    # could both observe PENDING and bind/issue sessions twice.
+    statement = select(FeishuBindingAttempt).where(FeishuBindingAttempt.state_hash == hash_token(state))
+    if db.bind and db.bind.dialect.name == "postgresql":
+        statement = statement.with_for_update()
+    attempt = db.scalar(statement)
     if not attempt or attempt.status != "PENDING":
         raise ApplicationError("FEISHU_BINDING_STATE_INVALID", "飞书绑定请求无效或已使用", 400)
     if _aware_utc(attempt.expires_at) < datetime.now(timezone.utc):
@@ -537,10 +732,33 @@ def _pending_binding_attempt(db: Session, state: str) -> FeishuBindingAttempt:
 
 def _complete_web_login(db: Session, attempt: FeishuBindingAttempt, identity: FeishuIdentity) -> Response:
     recruiter = db.scalar(
-        select(Recruiter).where(Recruiter.company_id == attempt.company_id, Recruiter.feishu_open_id == identity.open_id, Recruiter.status == "ACTIVE")
+        select(Recruiter).where(Recruiter.company_id == attempt.company_id, Recruiter.feishu_open_id == identity.open_id)
     )
-    if not recruiter or recruiter.role not in ADMIN_ROLES:
-        raise ApplicationError("ADMIN_LOGIN_REQUIRED", "该飞书账号没有开发管理后台权限", 403)
+    if recruiter and recruiter.status != "ACTIVE":
+        raise ApplicationError("ACCOUNT_DISABLED", "该招聘账号已停用，请联系管理员", 403)
+    if not recruiter:
+        # Every person in the Feishu app's published contact scope may enter
+        # the console.  Assignment controls data scope and extension access,
+        # not basic authentication.  Create a minimal identity record so the
+        # person can see the pending-assignment state and download the
+        # extension; no BOSS account or candidate data is attached yet.
+        identity_key = hashlib.sha256(f"{attempt.company_id}|{identity.open_id}".encode()).hexdigest()
+        recruiter = Recruiter(
+            company_id=attempt.company_id,
+            display_name=identity.display_name.strip() or "飞书成员",
+            feishu_open_id=identity.open_id,
+            feishu_user_id=identity.user_id,
+            feishu_display_name=identity.display_name.strip() or "飞书成员",
+            email=f"feishu-{identity_key[:24]}@identity.invalid",
+            password_hash="FEISHU_IDENTITY_CANNOT_PASSWORD_LOGIN",
+            role="RECRUITER",
+            status="ACTIVE",
+        )
+        db.add(recruiter)
+        db.flush()
+        db.add(RecruiterAccessProfile(company_id=attempt.company_id, recruiter_id=recruiter.id, data_scope="OWN"))
+    recruiter.feishu_user_id = identity.user_id or recruiter.feishu_user_id
+    recruiter.feishu_display_name = identity.display_name.strip() or recruiter.feishu_display_name
     attempt.recruiter_id, attempt.status, attempt.consumed_at = recruiter.id, "CONSUMED", now()
     db.commit()
     settings = get_settings()
@@ -558,44 +776,72 @@ def _complete_web_login(db: Session, attempt: FeishuBindingAttempt, identity: Fe
 
 
 def _complete_boss_binding(db: Session, attempt: FeishuBindingAttempt, identity: FeishuIdentity) -> HTMLResponse:
-    service = RecruitmentCollaborationService(db)
-    # The extension's simplified flow no longer reads a BOSS account name;
-    # use the authenticated Feishu display name as the recruiter identity.
-    account_name = identity.display_name if attempt.account_display_name == "飞书同步账号" else attempt.account_display_name
-    recruiter = None
-    if attempt.action == "unbind" and attempt.account_display_name == "飞书同步账号":
-        recruiter = db.scalar(select(Recruiter).where(Recruiter.company_id == attempt.company_id, Recruiter.feishu_open_id == identity.open_id, Recruiter.status == "ACTIVE"))
-    if recruiter is None:
-        recruiter = service.page_recruiter(attempt.company_id, account_name, create=attempt.action == "bind")
-    if not recruiter:
-        raise ApplicationError("PAGE_RECRUITER_NOT_FOUND", "对应的 BOSS 招聘人员不存在", 404)
-    if attempt.action == "bind":
-        if recruiter.feishu_open_id and recruiter.feishu_open_id != identity.open_id:
-            raise ApplicationError("BOSS_RECRUITER_ALREADY_BOUND", "该 BOSS 招聘人员已绑定其他飞书账号，请先由原账号解绑", 409)
-        other = db.scalar(
-            select(Recruiter).where(Recruiter.company_id == attempt.company_id, Recruiter.feishu_open_id == identity.open_id, Recruiter.id != recruiter.id)
+    account_name = attempt.account_display_name
+    account_statement = select(RecruitmentAccount).where(
+        RecruitmentAccount.company_id == attempt.company_id,
+        RecruitmentAccount.account_display_name == account_name,
+        RecruitmentAccount.status == "ACTIVE",
+    )
+    if db.bind and db.bind.dialect.name == "postgresql":
+        account_statement = account_statement.with_for_update()
+    account = db.scalar(account_statement)
+    if not account:
+        raise ApplicationError("BOSS_ACCOUNT_NOT_FOUND", "未识别当前 BOSS 招聘账号，请回到沟通页重新发起绑定", 404)
+    recruiter = db.scalar(
+        select(Recruiter).where(
+            Recruiter.company_id == attempt.company_id,
+            Recruiter.feishu_open_id == identity.open_id,
         )
-        previous_account = other.display_name if other else None
-        if other:
-            # A Feishu identity is also the production admin login identity.
-            # Moving that identity to another BOSS recruiter row must not
-            # silently remove the person's access to the operations console.
-            if other.role in ADMIN_ROLES and recruiter.role not in ADMIN_ROLES:
-                recruiter.role = other.role
-            _disconnect_recruiter_feishu(db, other)
-        recruiter.feishu_open_id = identity.open_id
-        recruiter.feishu_user_id = identity.user_id
-        recruiter.feishu_display_name = identity.display_name
+    )
+    if recruiter and recruiter.status != "ACTIVE":
+        raise ApplicationError("ACCOUNT_DISABLED", "该飞书账号已停用，请联系管理员", 403)
+    if not recruiter:
+        recruiter = _feishu_identity_recruiter(db, attempt.company_id, identity.open_id, identity.user_id, identity.display_name)
+        db.add(RecruiterAccessProfile(company_id=attempt.company_id, recruiter_id=recruiter.id, data_scope="OWN"))
+    assignment = db.scalar(select(BossAccountAssignment).where(BossAccountAssignment.boss_account_id == account.id, BossAccountAssignment.status == "ACTIVE")) if account else None
+    if assignment and assignment.feishu_recruiter_id != recruiter.id:
+        raise ApplicationError("BOSS_ACCOUNT_ASSIGNED_TO_OTHER", "这个 BOSS 账号已分配给其他飞书成员，请联系管理员替换负责人", 403)
+    if not assignment:
+        occupied = db.scalar(
+            select(BossAccountAssignment).where(
+                BossAccountAssignment.company_id == attempt.company_id,
+                BossAccountAssignment.feishu_recruiter_id == recruiter.id,
+                BossAccountAssignment.status == "ACTIVE",
+            )
+        )
+        if occupied:
+            raise ApplicationError("FEISHU_ALREADY_ASSIGNED", "你的飞书账号已绑定其他 BOSS 账号，如需更换请联系管理员", 409)
+        assignment = BossAccountAssignment(
+            company_id=attempt.company_id,
+            boss_account_id=account.id,
+            feishu_recruiter_id=recruiter.id,
+            feishu_open_id=identity.open_id,
+            feishu_display_name=identity.display_name.strip() or recruiter.display_name,
+            assignment_version=1,
+            assigned_at=now(),
+        )
+        db.add(assignment)
+        account.recruiter_id = recruiter.id
+        db.add(
+            AuditLog(
+                company_id=attempt.company_id,
+                actor_id=recruiter.id,
+                action="BOSS_ACCOUNT_SELF_ASSIGNED",
+                entity_type="RecruitmentAccount",
+                entity_id=account.id,
+                after_json={"feishu_open_id": identity.open_id, "feishu_display_name": identity.display_name},
+            )
+        )
+    recruiter.feishu_user_id = identity.user_id or recruiter.feishu_user_id
+    recruiter.feishu_display_name = identity.display_name.strip() or recruiter.feishu_display_name
+    if attempt.action == "bind":
         attempt.recruiter_id = recruiter.id
-        detail = f"{account_name} 已绑定到 {identity.display_name}"
-        if previous_account:
-            detail = f"已自动退出上一个 BOSS 招聘账号 {previous_account}；{detail}"
-        title = "飞书绑定成功"
+        detail = f"{identity.display_name} 已连接 BOSS 账号 {account_name}，以后无需重复绑定"
+        title = "扩展登录成功"
     else:
-        if recruiter.feishu_open_id != identity.open_id:
-            raise ApplicationError("FEISHU_UNBIND_FORBIDDEN", "只能由当前已绑定的飞书账号执行解绑", 403)
-        _disconnect_recruiter_feishu(db, recruiter)
-        title, detail = "飞书解绑成功", f"{account_name} 已停止接收飞书私聊提醒"
+        for device in db.scalars(select(PluginDevice).where(PluginDevice.recruiter_id == recruiter.id, PluginDevice.device_id == attempt.device_id)).all():
+            device.status, device.revoked_at, device.refresh_token_hash = "REVOKED", now(), None
+        title, detail = "扩展已退出", f"这台浏览器已停止同步 {account_name}"
     db.add(
         AuditLog(
             company_id=attempt.company_id,
@@ -659,7 +905,7 @@ def feishu_device_poll(body: FeishuDevicePollRequest, db: Session = Depends(get_
         "access_token": make_token(recruiter.id, recruiter.company_id, recruiter.role, device_id=attempt.device_id),
         "refresh_token": refresh_token,
         "device_id": attempt.device_id,
-        "user": {"display_name": recruiter.feishu_display_name or recruiter.display_name, "boss_account_name": recruiter.display_name},
+        "user": {"display_name": recruiter.feishu_display_name or recruiter.display_name, "boss_account_name": attempt.account_display_name},
     }
 
 
@@ -707,24 +953,44 @@ def message_sent(body: MessageSentRequest, actor: Actor = Depends(plugin_actor),
     return RecruitmentCollaborationService(db).record_message_sent(company_id, payload)
 
 
+@router.post("/plugin/boss-daily-metrics")
+def boss_daily_metrics(body: dict[str, Any], actor: Actor = Depends(plugin_actor), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Accept the six counters visible in BOSS's daily company dashboard.
+
+    The extension sends only labelled numeric counters and the selected date;
+    no HTML or screenshot is persisted. Repeated reads for the same account and
+    date update the row, making the midnight run idempotent.
+    """
+    if not get_settings().is_development:
+        raise ApplicationError("DAILY_EXTENSION_UPGRADE_REQUIRED", "请更新扩展后同步公司日报", 410)
+    account_name = str(body.get("account_display_name") or "").strip()
+    metric_date = str(body.get("metric_date") or "").strip()
+    if not account_name or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", metric_date):
+        raise ApplicationError("DAILY_METRIC_INVALID", "缺少 BOSS 账号或有效日期", 400)
+    account = db.scalar(select(RecruitmentAccount).where(RecruitmentAccount.company_id == actor.company_id, RecruitmentAccount.account_display_name == account_name, RecruitmentAccount.status == "ACTIVE"))
+    if not account or (not _has_company_data_scope(db, actor) and account.id not in db.scalars(_company_account_ids(db, actor)).all()):
+        raise ApplicationError("BOSS_ASSIGNMENT_REQUIRED", "当前飞书账号未分配该 BOSS 账号", 403)
+    allowed = {"boss_viewed_talent", "boss_started_chat", "boss_communication", "talent_viewed_boss", "talent_started_chat"}
+    values = {key: max(0, min(int(body.get(key, 0) or 0), 10_000_000)) for key in allowed}
+    row = db.scalar(select(BossDailyMetric).where(BossDailyMetric.company_id == actor.company_id, BossDailyMetric.boss_account_id == account.id, BossDailyMetric.metric_date == metric_date))
+    if not row:
+        row = BossDailyMetric(company_id=actor.company_id, boss_account_id=account.id, metric_date=metric_date, boss_name=account_name, **values)
+        db.add(row)
+    else:
+        for key, value in values.items(): setattr(row, key, value)
+        row.boss_name = account_name; row.source_observed_at = now()
+    db.commit()
+    return {"id": row.id, "metric_date": row.metric_date, "boss_account": row.boss_name, **values, "status": "SAVED"}
+
+
 @router.post("/plugin/conversations/sync")
 def sync_conversation(body: ConversationSyncRequest, actor: Actor = Depends(plugin_actor), db: Session = Depends(get_db)) -> dict[str, Any]:
     company_id = plugin_company_for_account(actor, body.account_display_name, db)
     if _ignored_boss_page(body):
         raise ApplicationError("UNSUPPORTED_PAGE", "仅候选人沟通页可同步会话")
-    if not body.has_recruiter_outbound:
-        return {
-            "candidate_source_id": None,
-            "result_type": "INBOUND_ONLY",
-            "matches": [],
-            "ui": {"severity": "success", "title": "", "message": ""},
-            "available_actions": [],
-            "account_mapping": {"status": "NOT_REQUIRED"},
-            "job_mapping": {"status": "NOT_EVALUATED"},
-        }
     if _aware_utc(body.sent_at) > datetime.now(timezone.utc) + timedelta(hours=24):
         raise ApplicationError("EVENT_TIME_INVALID", "会话时间不能晚于服务器时间", 400)
-    return RecruitmentCollaborationService(db).record_message_sent(company_id, _validated_plugin_payload(body))
+    return RecruitmentCollaborationService(db).sync_candidate_observation(company_id, _validated_plugin_payload(body))
 
 
 @router.get("/plugin/conversations/checkpoint")
@@ -740,8 +1006,100 @@ def get_scan_checkpoint(
         )
     )
     if not row:
-        return {"completed_through_at": (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat(), "cursor": {}, "initial": True}
-    return {"completed_through_at": row.completed_through_at.isoformat(), "cursor": row.cursor_json, "initial": False}
+        return {
+            "completed_through_at": datetime.now(timezone.utc).isoformat(),
+            "cursor": {},
+            "initial": True,
+            "historical_rescan": False,
+        }
+    cursor = row.cursor_json or {}
+    return {
+        "completed_through_at": _aware_utc(row.completed_through_at).isoformat(),
+        "cursor": cursor,
+        "initial": False,
+        "historical_rescan": cursor.get("mode") == "HISTORICAL_RESCAN",
+    }
+
+
+@router.get("/plugin/conversations/index")
+def get_conversation_index(
+    account_display_name: str = Query(min_length=1, max_length=100),
+    platform: str = "boss",
+    actor: Actor = Depends(plugin_actor),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Return account-scoped sync anchors used by list-first catch-up.
+
+    The extension compares BOSS list timestamps before opening a chat.  No
+    chat text, HTML, cookie or screenshot bytes are returned here.
+    """
+    company_id = plugin_company_for_account(actor, account_display_name, db)
+    account = db.scalar(
+        select(RecruitmentAccount).where(
+            RecruitmentAccount.company_id == company_id,
+            RecruitmentAccount.platform == platform,
+            RecruitmentAccount.account_display_name == account_display_name.strip(),
+        )
+    )
+    if not account:
+        return {"items": []}
+    rows = db.scalars(
+        select(CandidateSource).where(
+            CandidateSource.company_id == company_id,
+            CandidateSource.platform == platform,
+            CandidateSource.platform_account_id == account.id,
+        )
+    ).all()
+    return {
+        "items": [
+            {
+                "candidate_display_name": row.candidate_display_name,
+                "job_display_name": row.raw_job_name,
+                "conversation_updated_at": _aware_utc(row.conversation_updated_at or row.created_at).isoformat(),
+                "created_at": _aware_utc(row.created_at).isoformat(),
+                "recruiter_account": account_display_name.strip(),
+            }
+            for row in rows
+            if row.conversation_updated_at is not None
+        ]
+    }
+
+
+@router.post("/plugin/conversations/restart")
+def restart_scan(account_display_name: str = Query(min_length=1, max_length=100), platform: str = "boss", actor: Actor = Depends(plugin_actor), db: Session = Depends(get_db)) -> dict[str, Any]:
+    company_id = plugin_company_for_account(actor, account_display_name, db)
+    account_name = account_display_name.strip()
+    row = db.scalar(
+        select(ConversationScanCheckpoint).where(
+            ConversationScanCheckpoint.company_id == company_id,
+            ConversationScanCheckpoint.platform == platform,
+            ConversationScanCheckpoint.account_display_name == account_name,
+        )
+    )
+    # Keep an explicit old anchor instead of deleting the row.  A deleted row
+    # is read as "now" by the GET endpoint, which makes every existing BOSS
+    # conversation look older and silently skips the requested historical
+    # rescan.  The cursor marker also lets operators distinguish a deliberate
+    # full rescan from the normal first-install anchor.
+    scan_id = secrets.token_urlsafe(16)
+    if row:
+        row.completed_through_at = HISTORICAL_RESCAN_WATERMARK
+        row.cursor_json = {"mode": "HISTORICAL_RESCAN", "scan_id": scan_id, "complete": False}
+    else:
+        row = ConversationScanCheckpoint(
+            company_id=company_id,
+            platform=platform,
+            account_display_name=account_name,
+            completed_through_at=HISTORICAL_RESCAN_WATERMARK,
+            cursor_json={"mode": "HISTORICAL_RESCAN", "scan_id": scan_id, "complete": False},
+        )
+        db.add(row)
+    db.commit()
+    return {
+        "accepted": True,
+        "completed_through_at": HISTORICAL_RESCAN_WATERMARK.isoformat(),
+        "historical_rescan": True,
+    }
 
 
 @router.put("/plugin/conversations/checkpoint")
@@ -760,8 +1118,20 @@ def put_scan_checkpoint(body: ScanCheckpointRequest, actor: Actor = Depends(plug
         # Older extensions reported the newest individual candidate as if an
         # entire newest-to-oldest traversal had completed. Never let a partial
         # report move the high-water mark past candidates that were not seen.
-        completed = row.completed_through_at if row else datetime.now(timezone.utc) - timedelta(hours=48)
-        return {"completed_through_at": completed.isoformat(), "cursor": row.cursor_json if row else {}, "accepted": False}
+        completed = row.completed_through_at if row else datetime.now(timezone.utc)
+        return {"completed_through_at": _aware_utc(completed).isoformat(), "cursor": row.cursor_json if row else {}, "accepted": False}
+    if row and (row.cursor_json or {}).get("mode") == "HISTORICAL_RESCAN":
+        # A stale tab may finish an older incremental pass after an operator
+        # has requested a historical rescan.  It must not advance the new
+        # epoch anchor back to "now"; only the tab carrying this rescan's
+        # server-issued scan id may complete it.
+        expected_scan_id = (row.cursor_json or {}).get("scan_id")
+        if not expected_scan_id or body.cursor.get("scan_id") != expected_scan_id:
+            return {
+                "completed_through_at": _aware_utc(row.completed_through_at).isoformat(),
+                "cursor": row.cursor_json or {},
+                "accepted": False,
+            }
     if row:
         stored = row.completed_through_at if row.completed_through_at.tzinfo else row.completed_through_at.replace(tzinfo=timezone.utc)
         incoming = body.completed_through_at if body.completed_through_at.tzinfo else body.completed_through_at.replace(tzinfo=timezone.utc)
@@ -778,7 +1148,7 @@ def put_scan_checkpoint(body: ScanCheckpointRequest, actor: Actor = Depends(plug
         )
         db.add(row)
     db.commit()
-    return {"completed_through_at": row.completed_through_at.isoformat(), "cursor": row.cursor_json, "accepted": True}
+    return {"completed_through_at": _aware_utc(row.completed_through_at).isoformat(), "cursor": row.cursor_json, "accepted": True}
 
 
 @router.post("/plugin/conversations/{source_id}/snapshot")
@@ -806,9 +1176,7 @@ async def upload_conversation_snapshot(
         raise ApplicationError("SNAPSHOT_HASH_MISMATCH", "快照校验失败")
     source.snapshot_status = "PENDING"
     db.commit()
-    from recruitment_collab.infrastructure.bitable import BitableSyncClient
-
-    client = BitableSyncClient(get_settings())
+    client = _bitable_client(db, actor.company_id)
     try:
         tokens = [await run_in_threadpool(client.upload_snapshot, f"boss-chat-{source_id}-{index + 1}.jpg", content) for index, content in enumerate(contents)]
         service = RecruitmentCollaborationService(db)
@@ -875,10 +1243,8 @@ async def upload_candidate_resume(
     safe_name = Path(file.filename or "candidate-resume.pdf").name[:255]
     source.resume_status = "PENDING"
     db.commit()
-    from recruitment_collab.infrastructure.bitable import BitableSyncClient
-
     try:
-        token = await run_in_threadpool(BitableSyncClient(get_settings()).upload_resume, safe_name, content, content_type)
+        token = await run_in_threadpool(_bitable_client(db, actor.company_id).upload_resume, safe_name, content, content_type)
         service = RecruitmentCollaborationService(db)
         for value in source_ids:
             service.attach_resume(actor.company_id, value, token, resume_hash, safe_name)
@@ -962,19 +1328,23 @@ def diagnostics(body: DiagnosticRequest, actor: Actor = Depends(current_actor), 
 
 @router.get("/conflicts")
 def conflicts(actor: Actor = Depends(current_actor), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    return [serialize(row) for row in db.scalars(select(Conflict).where(Conflict.company_id == actor.company_id).order_by(Conflict.created_at.desc())).all()]
+    statement = _scope_statement("conflicts", select(Conflict).where(Conflict.company_id == actor.company_id), actor, db)
+    return [serialize(row) for row in db.scalars(statement.order_by(Conflict.created_at.desc())).all()]
 
 
 @router.get("/conflicts/{conflict_id}")
 def conflict_detail(conflict_id: str, actor: Actor = Depends(current_actor), db: Session = Depends(get_db)) -> dict[str, Any]:
     row = db.get(Conflict, conflict_id)
-    if not row or row.company_id != actor.company_id:
+    if not row or row.company_id != actor.company_id or not _row_visible_to_actor("conflicts", row, actor, db):
         raise ApplicationError("CONFLICT_NOT_FOUND", "冲突不存在", 404)
     return serialize(row)
 
 
 @router.post("/conflicts/{conflict_id}/exclude")
 def exclude(conflict_id: str, body: ReasonRequest, actor: Actor = Depends(current_actor), db: Session = Depends(get_db)) -> dict[str, bool]:
+    row = db.get(Conflict, conflict_id)
+    if not row or row.company_id != actor.company_id or not _row_visible_to_actor("conflicts", row, actor, db):
+        raise ApplicationError("CONFLICT_NOT_FOUND", "冲突不存在", 404)
     RecruitmentCollaborationService(db).exclude_conflict(conflict_id, actor.id, actor.company_id, body.reason)
     return {"success": True}
 
@@ -989,9 +1359,9 @@ def conflict_action(
     if action == "continue" and not body.reason.strip():
         raise ApplicationError("REASON_REQUIRED", "继续沟通必须填写原因")
     row = db.get(Conflict, conflict_id)
-    if not row or row.company_id != actor.company_id:
+    if not row or row.company_id != actor.company_id or not _row_visible_to_actor("conflicts", row, actor, db):
         raise ApplicationError("CONFLICT_NOT_FOUND", "冲突不存在", 404)
-    if action == "transfer" and actor.role not in ADMIN_ROLES:
+    if action == "transfer" and not _access_profile(db, actor).can_manage_team:
         raise ApplicationError("FORBIDDEN", "仅管理员可执行转交", 403)
     row.status = mapping[action]
     row.resolution = body.reason
@@ -1004,34 +1374,64 @@ def overview(actor: Actor = Depends(require_admin), db: Session = Depends(get_db
     def count(model: Any, *conditions: Any) -> int:
         return int(db.scalar(select(func.count()).select_from(model).where(*conditions)) or 0)
 
+    own_accounts = _company_account_ids(db, actor)
+    source_ownership = CandidateSource.platform_account_id.in_(own_accounts)
+    own_recruiter = not _has_company_data_scope(db, actor)
+    message_conditions = [RecruitmentEvent.company_id == actor.company_id, RecruitmentEvent.event_type == "MESSAGE_SENT"]
+    if own_recruiter:
+        message_conditions.append(
+            RecruitmentEvent.candidate_source_id.in_(
+                select(CandidateSource.id).where(CandidateSource.platform_account_id.in_(own_accounts))
+            )
+        )
     return {
-        "candidate_queries": count(CandidateSource, CandidateSource.company_id == actor.company_id),
-        "engagements": count(Engagement, Engagement.company_id == actor.company_id),
-        "open_conflicts": count(Conflict, Conflict.company_id == actor.company_id, Conflict.status == "OPEN"),
-        "interviews": count(Interview, Interview.company_id == actor.company_id, Interview.status == "SCHEDULED"),
+        "candidate_queries": count(CandidateSource, CandidateSource.company_id == actor.company_id, *( [source_ownership] if own_recruiter else [])),
+        "engagements": count(Engagement, Engagement.company_id == actor.company_id, *([Engagement.recruiter_id == actor.id] if own_recruiter else [])),
+        "open_conflicts": count(Conflict, Conflict.company_id == actor.company_id, Conflict.status == "OPEN", *([((Conflict.left_recruiter_id == actor.id) | (Conflict.right_recruiter_id == actor.id))] if own_recruiter else [])),
+        "interviews": count(Interview, Interview.company_id == actor.company_id, Interview.status == "SCHEDULED", *([Interview.recruiter_id == actor.id] if own_recruiter else [])),
         "unmapped_jobs": count(UnmappedJob, UnmappedJob.company_id == actor.company_id, UnmappedJob.resolved_job_id.is_(None)),
-        "notification_failures": count(NotificationOutbox, NotificationOutbox.company_id == actor.company_id, NotificationOutbox.status == "FAILED"),
+        "notification_failures": count(NotificationOutbox, NotificationOutbox.company_id == actor.company_id, NotificationOutbox.status == "FAILED", *([NotificationOutbox.recipient_recruiter_id == actor.id] if own_recruiter else [])),
+        "message_sent": count(RecruitmentEvent, *message_conditions),
     }
 
 
 @router.get("/admin/operations")
 def operations(actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     current = now()
-    candidate_sync = _status_counts(db, actor.company_id, CandidateSyncOutbox)
-    notifications = _status_counts(db, actor.company_id, NotificationOutbox)
+    own = not _has_company_data_scope(db, actor)
+    account_ids = _company_account_ids(db, actor)
+    source_ids = select(CandidateSource.id).where(CandidateSource.company_id == actor.company_id, CandidateSource.platform_account_id.in_(account_ids))
+    sync_statement = select(CandidateSyncOutbox.status, func.count()).where(CandidateSyncOutbox.company_id == actor.company_id)
+    notification_statement = select(NotificationOutbox.status, func.count()).where(NotificationOutbox.company_id == actor.company_id)
+    if own:
+        sync_statement = sync_statement.where(CandidateSyncOutbox.candidate_source_id.in_(source_ids))
+        notification_statement = notification_statement.where(NotificationOutbox.recipient_recruiter_id == actor.id)
+    candidate_sync = {str(status): int(count) for status, count in db.execute(sync_statement.group_by(CandidateSyncOutbox.status)).all()}
+    notifications = {str(status): int(count) for status, count in db.execute(notification_statement.group_by(NotificationOutbox.status)).all()}
     snapshot_statement = (
         select(CandidateSource.snapshot_status, func.count()).where(CandidateSource.company_id == actor.company_id).group_by(CandidateSource.snapshot_status)
     )
+    if own:
+        snapshot_statement = snapshot_statement.where(CandidateSource.platform_account_id.in_(account_ids))
     snapshot_counts = {str(status): int(count) for status, count in db.execute(snapshot_statement).all()}
-    source_count = int(db.scalar(select(func.count()).select_from(CandidateSource).where(CandidateSource.company_id == actor.company_id)) or 0)
-    checkpoint_count = int(
-        db.scalar(select(func.count()).select_from(ConversationScanCheckpoint).where(ConversationScanCheckpoint.company_id == actor.company_id)) or 0
-    )
-    lookup_alert_count = int(db.scalar(select(func.count()).select_from(DuplicateLookupAlert).where(DuplicateLookupAlert.company_id == actor.company_id)) or 0)
+    source_count_statement = select(func.count()).select_from(CandidateSource).where(CandidateSource.company_id == actor.company_id)
+    if own:
+        source_count_statement = source_count_statement.where(CandidateSource.platform_account_id.in_(account_ids))
+    source_count = int(db.scalar(source_count_statement) or 0)
+    checkpoint_statement = select(func.count()).select_from(ConversationScanCheckpoint).where(ConversationScanCheckpoint.company_id == actor.company_id)
+    if own:
+        checkpoint_statement = checkpoint_statement.where(ConversationScanCheckpoint.account_display_name.in_(select(RecruitmentAccount.account_display_name).where(RecruitmentAccount.recruiter_id == actor.id)))
+    checkpoint_count = int(db.scalar(checkpoint_statement) or 0)
+    lookup_statement = select(func.count()).select_from(DuplicateLookupAlert).where(DuplicateLookupAlert.company_id == actor.company_id)
+    if own:
+        lookup_statement = lookup_statement.where((DuplicateLookupAlert.viewer_recruiter_id == actor.id) | (DuplicateLookupAlert.matched_recruiter_id == actor.id))
+    lookup_alert_count = int(db.scalar(lookup_statement) or 0)
     workers, alerts = _worker_operations(db, current)
     queue_alerts, queue_values = _queue_alerts(candidate_sync, notifications, snapshot_counts, source_count, checkpoint_count)
     alerts.extend(queue_alerts)
-    bindings = _operation_bindings(db, actor.company_id)
+    bindings = _operation_bindings(db, actor.company_id, {actor.id} if own else None)
+    communication_summary = _communication_summary(db, actor)
+    message_sent_total = sum(item["message_count"] for item in communication_summary)
     settings = get_settings()
     return {
         "generated_at": current,
@@ -1048,29 +1448,616 @@ def operations(actor: Actor = Depends(require_admin), db: Session = Depends(get_
             "bound_recruiters": sum(item["bound"] for item in bindings),
             "checkpoints": checkpoint_count,
             "lookup_alerts": lookup_alert_count,
+            "message_sent_total": message_sent_total,
         },
+        "communication_summary": communication_summary,
         "workers": workers,
         "queues": {"candidate_sync": candidate_sync, "notifications": notifications, "snapshots": snapshot_counts},
         "bindings": bindings,
-        "recent_failures": _recent_outbox_failures(db, actor.company_id),
-        "diagnostics": _recent_diagnostics(db, actor.company_id),
+        "recent_failures": _recent_outbox_failures(db, actor.company_id) if not own else _recent_outbox_failures_for_actor(db, actor),
+        "diagnostics": _recent_diagnostics(db, actor.company_id) if not own else _recent_diagnostics_for_actor(db, actor),
         "configuration": {
             "environment": settings.app_env,
             "feishu_mode": settings.feishu_mode,
             "feishu_app_configured": bool(settings.feishu_app_id and settings.feishu_app_secret),
-            "feishu_candidate_table_configured": bool(settings.feishu_bitable_app_token and settings.feishu_bitable_candidate_table_id),
+            "feishu_candidate_table_configured": bool(_active_bitable(db, actor.company_id) or (settings.feishu_bitable_app_token and settings.feishu_bitable_candidate_table_id)),
             "retention_days": {
                 "candidate": settings.candidate_cache_days,
                 "diagnostic": settings.diagnostic_retention_days,
                 "event": settings.event_retention_days,
                 "audit": settings.audit_retention_days,
             },
+            "retention_run_interval_days": settings.retention_run_interval_days,
         },
     }
 
 
+def _extension_release() -> tuple[Path, dict[str, Any]]:
+    settings = get_settings()
+    package = Path(settings.extension_package_path).resolve()
+    metadata_path = Path(settings.extension_release_metadata_path).resolve()
+    if not package.is_file() or not metadata_path.is_file():
+        raise ApplicationError("EXTENSION_RELEASE_UNAVAILABLE", "扩展安装包暂不可用", 503)
+    try:
+        import json
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ApplicationError("EXTENSION_RELEASE_INVALID", "扩展发布信息暂不可用", 503) from exc
+    if not isinstance(metadata, dict) or not metadata.get("version"):
+        raise ApplicationError("EXTENSION_RELEASE_INVALID", "扩展发布信息暂不可用", 503)
+    return package, metadata
+
+
+def _access_profile(db: Session, actor: Actor) -> RecruiterAccessProfile:
+    profile = db.scalar(select(RecruiterAccessProfile).where(RecruiterAccessProfile.recruiter_id == actor.id, RecruiterAccessProfile.company_id == actor.company_id))
+    if profile:
+        return profile
+    # Compatibility for databases upgraded before the access-profile migration.
+    # Existing administrators retain the legacy company-wide scope until the
+    # migration backfills an explicit profile; new identities remain own-data.
+    company_scope = actor.role.upper() == "ADMIN"
+    return RecruiterAccessProfile(
+        company_id=actor.company_id,
+        recruiter_id=actor.id,
+        data_scope="COMPANY" if company_scope else "OWN",
+        can_manage_team=company_scope,
+        can_manage_feishu=company_scope,
+        can_manage_jobs=company_scope,
+        can_reset_system=company_scope,
+    )
+
+
+def _has_company_data_scope(db: Session, actor: Actor) -> bool:
+    """Return the single, explicit company-wide boundary used by reads.
+
+    A role administrator is authoritative.  A fully-enabled legacy profile
+    is supported, but partial capability combinations never broaden data
+    visibility beyond the recruiter's own BOSS account.
+    """
+    profile = _access_profile(db, actor)
+    return actor.role.upper() == "ADMIN" or bool(
+        profile.data_scope == "COMPANY"
+        and profile.can_manage_team
+        and profile.can_manage_feishu
+        and profile.can_manage_jobs
+        and profile.can_reset_system
+    )
+
+
+def _require_capability(db: Session, actor: Actor, capability: str) -> RecruiterAccessProfile:
+    profile = _access_profile(db, actor)
+    if not getattr(profile, capability, False):
+        raise ApplicationError("FORBIDDEN", "当前账号没有执行此操作的权限", 403)
+    return profile
+
+
+def _active_bitable(db: Session, company_id: str) -> FeishuBitableConfig | None:
+    return db.scalar(select(FeishuBitableConfig).where(FeishuBitableConfig.company_id == company_id, FeishuBitableConfig.status == "ACTIVE"))
+
+
+def _company_account_ids(db: Session, actor: Actor):
+    return select(RecruitmentAccount.id).where(RecruitmentAccount.company_id == actor.company_id, RecruitmentAccount.recruiter_id == actor.id)
+
+
+def _communication_summary(db: Session, actor: Actor) -> list[dict[str, Any]]:
+    """Aggregate confirmed outbound BOSS messages by recruiter and account.
+
+    ``MESSAGE_SENT`` is emitted only after the extension observes a successful
+    recruiter-side send.  Keeping this report derived from the event ledger
+    means it is independent of Feishu table delivery and remains correct when
+    a BOSS account is reassigned to another Feishu member.
+    """
+    account_ids = _company_account_ids(db, actor)
+    statement = (
+        select(
+            RecruitmentEvent.recruiter_id,
+            Recruiter.display_name,
+            Recruiter.feishu_display_name,
+            RecruitmentAccount.id.label("account_id"),
+            RecruitmentAccount.account_display_name,
+            func.count(RecruitmentEvent.id).label("message_count"),
+            func.count(func.distinct(RecruitmentEvent.candidate_source_id)).label("candidate_count"),
+            func.max(RecruitmentEvent.event_time).label("last_message_at"),
+        )
+        .join(CandidateSource, CandidateSource.id == RecruitmentEvent.candidate_source_id)
+        .join(RecruitmentAccount, RecruitmentAccount.id == CandidateSource.platform_account_id)
+        .join(Recruiter, Recruiter.id == RecruitmentEvent.recruiter_id)
+        .where(
+            RecruitmentEvent.company_id == actor.company_id,
+            RecruitmentEvent.event_type == "MESSAGE_SENT",
+        )
+    )
+    if not _has_company_data_scope(db, actor):
+        # A reassigned Feishu owner inherits the BOSS account's history. Scope
+        # by account rather than event recruiter so the new owner can still
+        # see the prior conversation totals.
+        statement = statement.where(CandidateSource.platform_account_id.in_(account_ids))
+    rows = db.execute(
+        statement.group_by(
+            RecruitmentEvent.recruiter_id,
+            Recruiter.display_name,
+            Recruiter.feishu_display_name,
+            RecruitmentAccount.id,
+            RecruitmentAccount.account_display_name,
+        ).order_by(func.max(RecruitmentEvent.event_time).desc())
+    ).all()
+    return [
+        {
+            "recruiter_id": recruiter_id,
+            "recruiter_name": feishu_display_name or display_name,
+            "boss_account_id": account_id,
+            "boss_account": account_display_name,
+            "message_count": int(message_count or 0),
+            "candidate_count": int(candidate_count or 0),
+            "last_message_at": last_message_at,
+        }
+        for recruiter_id, display_name, feishu_display_name, account_id, account_display_name, message_count, candidate_count, last_message_at in rows
+    ]
+
+
+def _candidate_message_counts(db: Session, source_ids: list[str]) -> dict[str, tuple[int, datetime | None]]:
+    if not source_ids:
+        return {}
+    rows = db.execute(
+        select(
+            RecruitmentEvent.candidate_source_id,
+            func.count(RecruitmentEvent.id),
+            func.max(RecruitmentEvent.event_time),
+        )
+        .where(
+            RecruitmentEvent.candidate_source_id.in_(source_ids),
+            RecruitmentEvent.event_type == "MESSAGE_SENT",
+        )
+        .group_by(RecruitmentEvent.candidate_source_id)
+    ).all()
+    return {source_id: (int(count or 0), last_message_at) for source_id, count, last_message_at in rows}
+
+
+def _scope_statement(resource: str, statement: Any, actor: Actor, db: Session) -> Any:
+    if _has_company_data_scope(db, actor):
+        return statement
+    account_ids = _company_account_ids(db, actor)
+    source_ids = select(CandidateSource.id).where(CandidateSource.company_id == actor.company_id, CandidateSource.platform_account_id.in_(account_ids))
+    filters = {
+        "boss-daily-metrics": BossDailyMetric.boss_account_id.in_(account_ids),
+        "recruiters": Recruiter.id == actor.id,
+        "accounts": RecruitmentAccount.recruiter_id == actor.id,
+        "candidate-sources": CandidateSource.platform_account_id.in_(account_ids),
+        "candidate-sync": CandidateSyncOutbox.candidate_source_id.in_(source_ids),
+        "lookup-alerts": (DuplicateLookupAlert.viewer_recruiter_id == actor.id) | (DuplicateLookupAlert.matched_recruiter_id == actor.id),
+        "conflicts": (Conflict.left_recruiter_id == actor.id) | (Conflict.right_recruiter_id == actor.id),
+        "interviews": Interview.recruiter_id == actor.id,
+        "notifications": NotificationOutbox.recipient_recruiter_id == actor.id,
+        "devices": PluginDevice.recruiter_id == actor.id,
+        "plugin-diagnostics": PluginDiagnostic.recruiter_id == actor.id,
+        "binding-attempts": FeishuBindingAttempt.recruiter_id == actor.id,
+        "scan-checkpoints": ConversationScanCheckpoint.account_display_name.in_(select(RecruitmentAccount.account_display_name).where(RecruitmentAccount.recruiter_id == actor.id)),
+        "audit-logs": AuditLog.actor_id == actor.id,
+    }
+    return statement.where(filters[resource]) if resource in filters else statement
+
+
+def _row_visible_to_actor(resource: str, row: Any, actor: Actor, db: Session) -> bool:
+    if _has_company_data_scope(db, actor):
+        return True
+    if resource == "recruiters":
+        return row.id == actor.id
+    if resource == "accounts" or resource == "devices" or resource == "plugin-diagnostics":
+        return getattr(row, "recruiter_id", None) == actor.id
+    if resource == "candidate-sources":
+        return row.platform_account_id in set(db.scalars(_company_account_ids(db, actor)).all())
+    if resource == "candidate-sync":
+        source = db.get(CandidateSource, row.candidate_source_id)
+        return bool(source and _row_visible_to_actor("candidate-sources", source, actor, db))
+    if resource == "notifications":
+        return row.recipient_recruiter_id == actor.id
+    if resource == "interviews":
+        return row.recruiter_id == actor.id
+    return True
+
+
+def _bitable_client(db: Session, company_id: str):
+    from recruitment_collab.infrastructure.bitable import BitableSyncClient
+
+    config = _active_bitable(db, company_id)
+    settings = get_settings()
+    return BitableSyncClient(settings, app_token=config.app_token if config else None, candidate_table_id=config.candidate_table_id if config else None)
+
+
+@router.get("/admin/feishu-tables")
+def list_feishu_tables(actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    _require_capability(db, actor, "can_manage_feishu")
+    rows = db.scalars(
+        select(FeishuBitableConfig)
+        .where(FeishuBitableConfig.company_id == actor.company_id)
+        .order_by(FeishuBitableConfig.status.asc(), FeishuBitableConfig.created_at.desc())
+    ).all()
+    return [
+        {
+            "id": row.id,
+            "table_name": row.table_name,
+            "table_url": row.table_url,
+            "app_token": f"{row.app_token[:4]}…{row.app_token[-4:]}",
+            "candidate_table_id": f"{row.candidate_table_id[:4]}…{row.candidate_table_id[-4:]}",
+            "status": row.status,
+            "validation": row.validation_json,
+            "validated_at": row.validated_at,
+            "activated_at": row.activated_at,
+        }
+        for row in rows
+    ]
+
+
+@router.get("/admin/access-profiles")
+def list_access_profiles(actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    _require_capability(db, actor, "can_manage_team")
+    rows = db.scalars(select(RecruiterAccessProfile).where(RecruiterAccessProfile.company_id == actor.company_id)).all()
+    recruiters = {row.id: row for row in db.scalars(select(Recruiter).where(Recruiter.company_id == actor.company_id)).all()}
+    return [
+        {
+            "id": row.id,
+            "recruiter_id": row.recruiter_id,
+            "recruiter_name": (
+                recruiters[row.recruiter_id].feishu_display_name or recruiters[row.recruiter_id].display_name
+                if row.recruiter_id in recruiters
+                else row.recruiter_id
+            ),
+            "role": recruiters[row.recruiter_id].role if row.recruiter_id in recruiters else "RECRUITER",
+            "data_scope": row.data_scope,
+            "can_manage_team": row.can_manage_team,
+            "can_manage_feishu": row.can_manage_feishu,
+            "can_manage_jobs": row.can_manage_jobs,
+            "can_reset_system": row.can_reset_system,
+        }
+        for row in rows
+    ]
+
+
+@router.patch("/admin/access-profiles/{recruiter_id}")
+def update_access_profile(recruiter_id: str, body: dict[str, Any], actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_manage_team")
+    recruiter = db.get(Recruiter, recruiter_id)
+    if not recruiter or recruiter.company_id != actor.company_id:
+        raise ApplicationError("RECRUITER_NOT_FOUND", "招聘者不存在", 404)
+    profile = db.scalar(select(RecruiterAccessProfile).where(RecruiterAccessProfile.recruiter_id == recruiter_id))
+    if not profile:
+        profile = RecruiterAccessProfile(company_id=actor.company_id, recruiter_id=recruiter_id)
+        db.add(profile)
+    allowed = {"data_scope", "can_manage_team", "can_manage_feishu", "can_manage_jobs", "can_reset_system"}
+    unknown = set(body) - allowed
+    if unknown:
+        raise ApplicationError("FIELD_NOT_EDITABLE", f"字段不可编辑：{', '.join(sorted(unknown))}", 400)
+    if body.get("data_scope") not in {None, "OWN", "COMPANY"}:
+        raise ApplicationError("INVALID_DATA_SCOPE", "数据范围必须是 OWN 或 COMPANY", 400)
+    capability_names = ("can_manage_team", "can_manage_feishu", "can_manage_jobs", "can_reset_system")
+    if any(key in body and not isinstance(body[key], bool) for key in capability_names):
+        raise ApplicationError("INVALID_CAPABILITY", "权限开关必须是布尔值", 400)
+    proposed = {
+        "data_scope": body.get("data_scope", profile.data_scope),
+        **{key: body.get(key, getattr(profile, key)) for key in capability_names},
+    }
+    full_admin = proposed["data_scope"] == "COMPANY" and all(proposed[key] for key in capability_names)
+    regular_recruiter = proposed["data_scope"] == "OWN" and not any(proposed[key] for key in capability_names)
+    if not (full_admin or regular_recruiter):
+        raise ApplicationError(
+            "PARTIAL_ADMIN_PROFILE_NOT_ALLOWED",
+            "权限必须选择完整管理员或普通招聘人员，不能保存半管理员状态",
+            400,
+        )
+    if recruiter_id == actor.id and regular_recruiter:
+        raise ApplicationError("ADMIN_SELF_REVOKE_FORBIDDEN", "不能移除自己的管理员权限，请让其他管理员操作", 403)
+    for key, value in proposed.items():
+        setattr(profile, key, value)
+    recruiter.role = "ADMIN" if full_admin else "RECRUITER"
+    db.add(
+        AuditLog(
+            company_id=actor.company_id,
+            actor_id=actor.id,
+            action="ADMIN_GRANTED" if full_admin else "ADMIN_REVOKED",
+            entity_type="recruiter",
+            entity_id=recruiter.id,
+            after_json={"role": recruiter.role, **proposed},
+        )
+    )
+    db.commit()
+    return {"recruiter_id": recruiter_id, "role": recruiter.role, "data_scope": profile.data_scope, "can_manage_team": profile.can_manage_team, "can_manage_feishu": profile.can_manage_feishu, "can_manage_jobs": profile.can_manage_jobs, "can_reset_system": profile.can_reset_system}
+
+
+def _feishu_identity_recruiter(db: Session, company_id: str, open_id: str, user_id: str | None, display_name: str) -> Recruiter:
+    """Find the recruiter identity for a Feishu member, creating a placeholder
+    when the member has not logged in yet, so administrators can be granted
+    to any person in the app's contact scope before their first visit."""
+    recruiter = db.scalar(select(Recruiter).where(Recruiter.company_id == company_id, Recruiter.feishu_open_id == open_id, Recruiter.status == "ACTIVE"))
+    if recruiter:
+        recruiter.feishu_user_id = user_id or recruiter.feishu_user_id
+        recruiter.feishu_display_name = display_name or recruiter.feishu_display_name
+        return recruiter
+    identity_key = hashlib.sha256(f"{company_id}|{open_id}".encode()).hexdigest()
+    recruiter = Recruiter(
+        company_id=company_id,
+        display_name=display_name.strip() or "飞书成员",
+        feishu_open_id=open_id,
+        feishu_user_id=user_id,
+        feishu_display_name=display_name.strip() or "飞书成员",
+        email=f"feishu-{identity_key[:24]}@identity.invalid",
+        password_hash="FEISHU_IDENTITY_CANNOT_PASSWORD_LOGIN",
+        role="RECRUITER",
+        status="ACTIVE",
+    )
+    db.add(recruiter)
+    db.flush()
+    return recruiter
+
+
+def _admin_profile(db: Session, company_id: str, recruiter_id: str) -> RecruiterAccessProfile:
+    profile = db.scalar(select(RecruiterAccessProfile).where(RecruiterAccessProfile.company_id == company_id, RecruiterAccessProfile.recruiter_id == recruiter_id))
+    if not profile:
+        profile = RecruiterAccessProfile(company_id=company_id, recruiter_id=recruiter_id)
+        db.add(profile)
+    return profile
+
+
+@router.put("/admin/admins")
+def grant_admin(body: AdminGrantRequest, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Promote any Feishu member in the app scope to a full administrator.
+
+    Administrators are not hard-coded: any number of members can hold admin
+    capabilities, and the grant works even before the member first logs in.
+    """
+    _require_capability(db, actor, "can_manage_team")
+    target = _feishu_identity_recruiter(db, actor.company_id, body.feishu_open_id, body.feishu_user_id, body.feishu_display_name)
+    profile = _admin_profile(db, actor.company_id, target.id)
+    profile.data_scope = "COMPANY"
+    profile.can_manage_team = True
+    profile.can_manage_feishu = True
+    profile.can_manage_jobs = True
+    profile.can_reset_system = True
+    if target.role != "ADMIN":
+        target.role = "ADMIN"
+    db.add(AuditLog(company_id=actor.company_id, actor_id=actor.id, action="ADMIN_GRANTED", entity_type="recruiter", entity_id=target.id, after_json={"feishu_open_id": target.feishu_open_id, "feishu_display_name": target.feishu_display_name}))
+    db.commit()
+    return {"recruiter_id": target.id, "feishu_display_name": target.feishu_display_name, "data_scope": profile.data_scope, "can_manage_team": True, "can_manage_feishu": True, "can_manage_jobs": True, "can_reset_system": True}
+
+
+@router.delete("/admin/admins/{recruiter_id}")
+def revoke_admin(recruiter_id: str, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, bool]:
+    """Remove administration rights from a member; the member keeps their
+    Feishu identity and any BOSS account assignment."""
+    _require_capability(db, actor, "can_manage_team")
+    if recruiter_id == actor.id:
+        raise ApplicationError("ADMIN_SELF_REVOKE_FORBIDDEN", "不能在这里移除自己的管理员权限，请让其他管理员操作", 403)
+    target = db.get(Recruiter, recruiter_id)
+    if not target or target.company_id != actor.company_id:
+        raise ApplicationError("RECRUITER_NOT_FOUND", "招聘者不存在", 404)
+    profile = db.scalar(select(RecruiterAccessProfile).where(RecruiterAccessProfile.company_id == actor.company_id, RecruiterAccessProfile.recruiter_id == recruiter_id))
+    if profile:
+        profile.data_scope = "OWN"
+        profile.can_manage_team = False
+        profile.can_manage_feishu = False
+        profile.can_manage_jobs = False
+        profile.can_reset_system = False
+    if target.role == "ADMIN":
+        target.role = "RECRUITER"
+    db.add(AuditLog(company_id=actor.company_id, actor_id=actor.id, action="ADMIN_REVOKED", entity_type="recruiter", entity_id=target.id, after_json={"feishu_open_id": target.feishu_open_id, "feishu_display_name": target.feishu_display_name}))
+    db.commit()
+    return {"success": True}
+
+
+@router.post("/admin/feishu-tables/validate")
+def validate_feishu_table(body: FeishuTableValidateRequest, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_manage_feishu")
+    from recruitment_collab.infrastructure.bitable import BitableSyncClient
+
+    try:
+        app_token, table_id = BitableSyncClient.parse_table_url(body.table_url)
+    except ValueError as exc:
+        raise ApplicationError("FEISHU_TABLE_URL_INVALID", "请粘贴包含 Base 和 table 参数的飞书多维表格链接", 400) from exc
+    active = _active_bitable(db, actor.company_id)
+    settings = get_settings()
+    if active and (active.app_token, active.candidate_table_id) == (app_token, table_id):
+        raise ApplicationError("FEISHU_TABLE_ALREADY_ACTIVE", "不能再次验证当前正在使用的表格", 409)
+    if not active and (settings.feishu_bitable_app_token, settings.feishu_bitable_candidate_table_id) == (app_token, table_id):
+        raise ApplicationError("FEISHU_TABLE_ALREADY_ACTIVE", "不能再次验证当前正在使用的表格", 409)
+    client = BitableSyncClient(settings, app_token=app_token, candidate_table_id=table_id)
+    try:
+        validation = client.table_probe()
+        if validation["type_mismatches"]:
+            raise ApplicationError("FEISHU_TABLE_FIELD_TYPE_MISMATCH", "目标表存在必需字段类型冲突，请修正后重试", 400)
+        client.write_probe()
+    except ApplicationError:
+        raise
+    except Exception as exc:
+        raise ApplicationError("FEISHU_TABLE_VALIDATION_FAILED", "目标表权限或结构验证失败，请检查飞书应用权限", 400) from exc
+    row = FeishuBitableConfig(
+        company_id=actor.company_id,
+        table_url=body.table_url.strip(),
+        app_token=app_token,
+        candidate_table_id=table_id,
+        table_name=validation["table_name"],
+        status="PENDING",
+        validation_json=validation,
+        validated_at=now(),
+        created_by=actor.id,
+    )
+    db.add(row)
+    db.commit()
+    return {"id": row.id, "table_name": row.table_name, "record_count": validation["record_count"], "missing_fields": validation["missing_fields"], "type_mismatches": []}
+
+
+@router.post("/admin/feishu-tables/{table_id}/clear-and-activate")
+def activate_feishu_table(table_id: str, body: FeishuTableActivateRequest, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_manage_feishu")
+    row = db.scalar(select(FeishuBitableConfig).where(FeishuBitableConfig.id == table_id, FeishuBitableConfig.company_id == actor.company_id, FeishuBitableConfig.status == "PENDING"))
+    if not row:
+        raise ApplicationError("FEISHU_TABLE_NOT_FOUND", "待启用的飞书表验证记录不存在或已处理", 404)
+    if body.confirmation.strip() != f"清空 {row.table_name}":
+        raise ApplicationError("FEISHU_TABLE_CONFIRMATION_REQUIRED", f"请输入：清空 {row.table_name}", 400)
+    from recruitment_collab.infrastructure.bitable import BitableSyncClient
+
+    client = BitableSyncClient(get_settings(), app_token=row.app_token, candidate_table_id=row.candidate_table_id)
+    try:
+        deleted = client.clear_records()
+        validation = client.table_probe()
+        if validation["record_count"] != 0:
+            raise RuntimeError("FEISHU_TABLE_NOT_EMPTY_AFTER_CLEAR")
+    except Exception as exc:
+        raise ApplicationError("FEISHU_TABLE_CLEAR_FAILED", "清空目标表失败，当前使用中的表格未改变", 409) from exc
+    old = _active_bitable(db, actor.company_id)
+    if old:
+        old.status = "ARCHIVED"
+    row.status, row.activated_at, row.validation_json = "ACTIVE", now(), {**row.validation_json, "record_count": 0, "cleared_records": deleted}
+    db.commit()
+    return {"id": row.id, "status": row.status, "table_name": row.table_name, "cleared_records": deleted}
+
+
+@router.get("/admin/feishu-tables/active/open-url")
+def active_feishu_table_url(actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, str]:
+    _require_capability(db, actor, "can_manage_feishu")
+    row = _active_bitable(db, actor.company_id)
+    if not row or not row.table_url:
+        raise ApplicationError("FEISHU_TABLE_NOT_CONFIGURED", "尚未配置飞书候选人表", 404)
+    return {"table_url": row.table_url}
+
+
+def _admin_member_ids(db: Session, company_id: str) -> set[str]:
+    """Return full administrators; partial historical profiles are never
+    preserved as administrators during a system reset."""
+    ids: set[str] = set(
+        db.scalars(
+            select(RecruiterAccessProfile.recruiter_id).where(
+                RecruiterAccessProfile.company_id == company_id,
+                RecruiterAccessProfile.data_scope == "COMPANY",
+                RecruiterAccessProfile.can_manage_team.is_(True),
+                RecruiterAccessProfile.can_manage_feishu.is_(True),
+                RecruiterAccessProfile.can_manage_jobs.is_(True),
+                RecruiterAccessProfile.can_reset_system.is_(True),
+            )
+        ).all()
+    )
+    ids |= set(db.scalars(select(Recruiter.id).where(Recruiter.company_id == company_id, Recruiter.role == "ADMIN", Recruiter.status == "ACTIVE")).all())
+    return ids
+
+
+def _reset_preview(db: Session, company_id: str, actor_id: str) -> tuple[dict[str, int], str, list[Recruiter]]:
+    keep_ids = _admin_member_ids(db, company_id)
+    keep_ids.add(actor_id)  # The requesting administrator always survives.
+    keep = list(db.scalars(select(Recruiter).where(Recruiter.company_id == company_id, Recruiter.id.in_(keep_ids), Recruiter.status == "ACTIVE")).all())
+    keep_ids = {recruiter.id for recruiter in keep}
+    models: list[tuple[str, Any]] = [
+        ("binding_attempts", FeishuBindingAttempt), ("accounts", RecruitmentAccount), ("boss_assignments", BossAccountAssignment),
+        ("devices", PluginDevice), ("candidate_sources", CandidateSource), ("engagements", Engagement),
+        ("interviews", Interview), ("events", RecruitmentEvent), ("conflicts", Conflict),
+        ("conflict_exclusions", ConflictExclusion), ("candidate_sync", CandidateSyncOutbox), ("notifications", Notification),
+        ("notification_outbox", NotificationOutbox), ("lookup_alerts", DuplicateLookupAlert),
+        ("checkpoints", ConversationScanCheckpoint), ("diagnostics", PluginDiagnostic), ("unmapped_jobs", UnmappedJob),
+        ("audit_logs", AuditLog), ("legacy_recruiters", Recruiter),
+    ]
+    counts: dict[str, int] = {}
+    for name, model in models:
+        if model is Recruiter:
+            statement = select(func.count()).select_from(model).where(model.company_id == company_id, model.id.not_in(keep_ids))
+        elif hasattr(model, "company_id"):
+            statement = select(func.count()).select_from(model).where(model.company_id == company_id)
+        else:
+            statement = select(func.count()).select_from(model).where(MockFeishuMessage.recipient_recruiter_id.in_(select(Recruiter.id).where(Recruiter.company_id == company_id)))
+        counts[name] = int(db.scalar(statement) or 0)
+    version = hashlib.sha256(f"{company_id}|{','.join(sorted(keep_ids))}|{sorted(counts.items())}".encode()).hexdigest()
+    return counts, version, keep
+
+
+@router.get("/admin/system-reset/preview")
+def system_reset_preview(actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_reset_system")
+    counts, version, keep = _reset_preview(db, actor.company_id, actor.id)
+    active_table = _active_bitable(db, actor.company_id)
+    return {
+        "preview_version": version,
+        "counts": counts,
+        "keep_identities": [{"id": recruiter.id, "display_name": recruiter.display_name, "feishu_display_name": recruiter.feishu_display_name} for recruiter in keep],
+        "active_table": active_table.table_name if active_table else None,
+        "irreversible": True,
+    }
+
+
+@router.post("/admin/system-reset")
+def system_reset(body: SystemResetRequest, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_reset_system")
+    counts, version, keep = _reset_preview(db, actor.company_id, actor.id)
+    keep_ids = [recruiter.id for recruiter in keep]
+    if body.preview_version != version or body.confirmation.strip() != "重新初始化同步":
+        raise ApplicationError("RESET_CONFIRMATION_REQUIRED", "预览已变化或确认词不正确，请重新预览并输入“重新初始化同步”", 409)
+    setting = _company_settings(db, actor.company_id)
+    if setting.reset_in_progress:
+        raise ApplicationError("RESET_ALREADY_RUNNING", "系统重置正在执行", 409)
+    setting.reset_in_progress = True
+    db.commit()
+    try:
+        company_id = actor.company_id
+        db.execute(delete(Notification).where(Notification.company_id == company_id))
+        db.execute(delete(NotificationOutbox).where(NotificationOutbox.company_id == company_id))
+        models_to_delete: tuple[Any, ...] = (DuplicateLookupAlert, ConflictExclusion, Conflict, CandidateSyncOutbox, Interview, RecruitmentEvent, Engagement, CandidateSource, ConversationScanCheckpoint, PluginDiagnostic, FeishuBindingAttempt, UnmappedJob, MockFeishuMessage)
+        for model in models_to_delete:
+            if model is MockFeishuMessage:
+                db.execute(delete(model).where(model.recipient_recruiter_id.in_(select(Recruiter.id).where(Recruiter.company_id == company_id))))
+            else:
+                db.execute(delete(model).where(model.company_id == company_id))
+        db.execute(delete(BossAccountAssignment).where(BossAccountAssignment.company_id == company_id))
+        db.execute(delete(RecruitmentAccount).where(RecruitmentAccount.company_id == company_id))
+        db.execute(delete(PluginDevice).where(PluginDevice.company_id == company_id))
+        db.execute(delete(RecruiterAccessProfile).where(RecruiterAccessProfile.company_id == company_id, RecruiterAccessProfile.recruiter_id.not_in(keep_ids)))
+        db.execute(update(FeishuBitableConfig).where(FeishuBitableConfig.company_id == company_id, FeishuBitableConfig.created_by.not_in(keep_ids)).values(created_by=None))
+        db.execute(delete(AuditLog).where(AuditLog.company_id == company_id))
+        # A previous reset job may reference a recruiter removed by this run.
+        db.execute(update(SystemResetJob).where(SystemResetJob.company_id == company_id).values(requested_by=actor.id))
+        db.execute(delete(Recruiter).where(Recruiter.company_id == company_id, Recruiter.id.not_in(keep_ids)))
+        db.execute(update(WorkerHeartbeat).values(total_processed=0, last_error_code=None, last_success_at=None, status="HEALTHY"))
+        setting.reset_generation += 1
+        setting.reset_in_progress = False
+        job = db.scalar(select(SystemResetJob).where(SystemResetJob.company_id == company_id))
+        if not job:
+            job = SystemResetJob(company_id=company_id, requested_by=actor.id, preview_version=version)
+            db.add(job)
+        else:
+            # The previous requester may have been deleted by this reset.
+            job.requested_by = actor.id
+        job.status, job.preview_version, job.counts_json, job.finished_at, job.error_message = "COMPLETED", version, counts, now(), None
+        db.flush()
+        db.add(AuditLog(company_id=company_id, actor_id=actor.id, action="SYSTEM_RESET_COMPLETED", entity_type="SystemResetJob", entity_id=job.id, after_json={"counts": counts}))
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        setting = _company_settings(db, actor.company_id)
+        setting.reset_in_progress = False
+        db.commit()
+        raise ApplicationError("SYSTEM_RESET_FAILED", "系统重置失败，未完成清理，请检查服务日志", 500) from exc
+    return {"status": "COMPLETED", "counts": counts, "kept_recruiter_ids": keep_ids, "reset_generation": setting.reset_generation}
+
+
+@router.get("/admin/extension-release")
+def extension_release(response: Response, actor: Actor = Depends(require_admin)) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    package, metadata = _extension_release()
+    return {**metadata, "file_name": metadata.get("file_name", package.name), "size_bytes": package.stat().st_size}
+
+
+@router.get("/admin/extension-release/download")
+def extension_release_download(actor: Actor = Depends(require_admin)) -> FileResponse:
+    package, metadata = _extension_release()
+    return FileResponse(
+        package,
+        media_type="application/zip",
+        filename=metadata.get("file_name", package.name),
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
+
+
 @router.post("/admin/devices/{device_id}/revoke")
 def admin_revoke_device(device_id: str, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, bool]:
+    # The console is now open to every Feishu member in the app scope, so
+    # company-wide mutations must be capability-gated instead of relying on
+    # the previous admin-only login.
+    _require_capability(db, actor, "can_manage_team")
     device = db.scalar(select(PluginDevice).where(PluginDevice.device_id == device_id, PluginDevice.company_id == actor.company_id))
     if not device:
         raise ApplicationError("DEVICE_NOT_FOUND", "扩展设备不存在", 404)
@@ -1079,10 +2066,97 @@ def admin_revoke_device(device_id: str, actor: Actor = Depends(require_admin), d
     return {"success": True}
 
 
+@router.get("/admin/boss-accounts")
+def list_boss_accounts(actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    _require_capability(db, actor, "can_manage_team")
+    accounts = db.scalars(select(RecruitmentAccount).where(RecruitmentAccount.company_id == actor.company_id, RecruitmentAccount.status == "ACTIVE").order_by(RecruitmentAccount.account_display_name)).all()
+    result = []
+    for account in accounts:
+        assignment = db.scalar(select(BossAccountAssignment).where(BossAccountAssignment.boss_account_id == account.id, BossAccountAssignment.status == "ACTIVE"))
+        source_count = int(db.scalar(select(func.count()).select_from(CandidateSource).where(CandidateSource.platform_account_id == account.id)) or 0)
+        device_count = int(db.scalar(select(func.count()).select_from(PluginDevice).where(PluginDevice.recruiter_id == assignment.feishu_recruiter_id, PluginDevice.status == "ACTIVE")) or 0) if assignment and assignment.feishu_recruiter_id else 0
+        result.append({
+            "id": account.id, "boss_account": account.account_display_name, "platform": account.platform,
+            "assignment_version": assignment.assignment_version if assignment else 0,
+            "feishu_open_id": assignment.feishu_open_id if assignment else None,
+            "feishu_display_name": assignment.feishu_display_name if assignment else None,
+            "source_count": source_count, "active_device_count": device_count,
+            "assigned_at": assignment.assigned_at if assignment else None,
+            "status": "ASSIGNED" if assignment and assignment.feishu_recruiter_id else "UNASSIGNED",
+        })
+    return result
+
+
+@router.get("/admin/feishu/directory")
+async def feishu_directory(query: str = Query(default="", max_length=100), actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    _require_capability(db, actor, "can_manage_team")
+    settings = get_settings()
+    # Mock/development mode intentionally uses the local identity cache.  In
+    # real mode the response must be the current Feishu app-visible scope;
+    # returning previously logged-in identities on provider failure made the
+    # UI look complete while silently hiding most of the directory.
+    if settings.feishu_mode != "real":
+        cached = db.scalars(select(Recruiter).where(Recruiter.company_id == actor.company_id, Recruiter.feishu_open_id.is_not(None), Recruiter.status == "ACTIVE")).all()
+        return [
+            {"open_id": r.feishu_open_id, "user_id": r.feishu_user_id, "display_name": r.feishu_display_name or r.display_name}
+            for r in cached
+            if not query or query.casefold() in (r.feishu_display_name or r.display_name).casefold()
+        ]
+    from recruitment_collab.infrastructure.feishu import FeishuDirectoryClient, FeishuDirectoryError
+    try:
+        return await FeishuDirectoryClient(settings).list_users(query)
+    except FeishuDirectoryError as exc:
+        if exc.stage == "USER_FIELDS" and exc.code == "NAME_PERMISSION_MISSING":
+            raise ApplicationError(
+                "FEISHU_DIRECTORY_NAME_PERMISSION_REQUIRED",
+                "飞书应用缺少“获取用户基本信息”权限，请在开放平台开通 contact:user.base:readonly 并发布新版本",
+                503,
+            ) from exc
+        raise ApplicationError("FEISHU_DIRECTORY_UNAVAILABLE", "飞书通讯录暂时不可用，请检查应用通讯录权限和已发布版本后重试", 503) from exc
+    except Exception as exc:
+        raise ApplicationError("FEISHU_DIRECTORY_UNAVAILABLE", "飞书通讯录暂时不可用，请检查应用通讯录权限和已发布版本后重试", 503) from exc
+
+
+@router.put("/admin/boss-accounts/{account_id}/assignment")
+def replace_boss_assignment(account_id: str, body: BossAccountAssignmentRequest, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_manage_team")
+    account = db.scalar(select(RecruitmentAccount).where(RecruitmentAccount.id == account_id, RecruitmentAccount.company_id == actor.company_id, RecruitmentAccount.status == "ACTIVE"))
+    if not account:
+        raise ApplicationError("BOSS_ACCOUNT_NOT_FOUND", "BOSS 账号不存在", 404)
+    current = db.scalar(select(BossAccountAssignment).where(BossAccountAssignment.boss_account_id == account.id, BossAccountAssignment.status == "ACTIVE"))
+    old_owner_id = current.feishu_recruiter_id if current else account.recruiter_id
+    if current and body.expected_version is not None and current.assignment_version != body.expected_version:
+        raise ApplicationError("ASSIGNMENT_VERSION_CONFLICT", "账号绑定已被其他管理员更新，请刷新后重试", 409)
+    target = db.scalar(select(Recruiter).where(Recruiter.company_id == actor.company_id, Recruiter.feishu_open_id == body.feishu_open_id, Recruiter.status == "ACTIVE"))
+    if not target:
+        identity_key = hashlib.sha256(f"{actor.company_id}|{body.feishu_open_id}".encode()).hexdigest()
+        target = Recruiter(company_id=actor.company_id, display_name=body.feishu_display_name, feishu_open_id=body.feishu_open_id, feishu_user_id=body.feishu_user_id, feishu_display_name=body.feishu_display_name, email=f"feishu-{identity_key[:24]}@identity.invalid", password_hash="FEISHU_IDENTITY_CANNOT_PASSWORD_LOGIN", role="RECRUITER", status="ACTIVE")
+        db.add(target); db.flush(); db.add(RecruiterAccessProfile(company_id=actor.company_id, recruiter_id=target.id, data_scope="OWN"))
+    occupied = db.scalar(select(BossAccountAssignment).where(BossAccountAssignment.company_id == actor.company_id, BossAccountAssignment.feishu_recruiter_id == target.id, BossAccountAssignment.status == "ACTIVE", BossAccountAssignment.boss_account_id != account.id))
+    if occupied:
+        raise ApplicationError("FEISHU_ALREADY_ASSIGNED", "该飞书账号已经绑定其他 BOSS 账号，请先替换或解绑", 409)
+    if current and current.feishu_recruiter_id == target.id:
+        return {"id": account.id, "status": "ASSIGNED", "feishu_display_name": target.feishu_display_name, "assignment_version": current.assignment_version}
+    stamp = now()
+    if current:
+        current.status, current.unassigned_at = "REPLACED", stamp
+    assignment = BossAccountAssignment(company_id=actor.company_id, boss_account_id=account.id, feishu_recruiter_id=target.id, feishu_open_id=target.feishu_open_id, feishu_display_name=target.feishu_display_name, assignment_version=(current.assignment_version + 1 if current else 1), assigned_at=stamp)
+    db.add(assignment); db.flush()
+    if current: current.replaced_by_id = assignment.id
+    account.recruiter_id = target.id
+    for device in db.scalars(select(PluginDevice).where(PluginDevice.company_id == actor.company_id, PluginDevice.recruiter_id == old_owner_id, PluginDevice.status == "ACTIVE")).all():
+        device.status, device.revoked_at, device.refresh_token_hash = "REVOKED", stamp, None
+    db.add(AuditLog(company_id=actor.company_id, actor_id=actor.id, action="BOSS_ACCOUNT_ASSIGNMENT_REPLACED", entity_type="RecruitmentAccount", entity_id=account.id, after_json={"feishu_open_id": target.feishu_open_id, "feishu_display_name": target.feishu_display_name}))
+    inherited_count = RecruitmentCollaborationService(db).requeue_account_sources(account.id)
+    db.commit()
+    return {"id": account.id, "status": "ASSIGNED", "feishu_display_name": target.feishu_display_name, "assignment_version": assignment.assignment_version, "inherited_candidate_count": inherited_count}
+
+
 @router.post("/admin/candidate-sync/{outbox_id}/retry")
 def admin_retry_candidate_sync(outbox_id: str, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, bool]:
     row = db.scalar(select(CandidateSyncOutbox).where(CandidateSyncOutbox.id == outbox_id, CandidateSyncOutbox.company_id == actor.company_id))
-    if not row or row.status not in {"FAILED", "PENDING"}:
+    # Personal-scope members may only retry their own accounts' sync rows.
+    if not row or not _row_visible_to_actor("candidate-sync", row, actor, db) or row.status not in {"FAILED", "PENDING"}:
         raise ApplicationError("SYNC_RETRY_NOT_ALLOWED", "同步任务不存在或当前状态不允许重试", 409)
     if not row.payload_json:
         raise ApplicationError("SYNC_PAYLOAD_EXPIRED", "同步载荷已按保留期限清除，请由扩展重新同步该候选人", 409)
@@ -1091,52 +2165,65 @@ def admin_retry_candidate_sync(outbox_id: str, actor: Actor = Depends(require_ad
     return {"success": True}
 
 
+@router.get("/admin/settings", include_in_schema=False)
+def settings_early(actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Keep the concrete settings endpoint ahead of the generic resource route."""
+    row = serialize(_company_settings(db, actor.company_id))
+    config = get_settings()
+    row.update({"api_base_url": f"{config.public_web_url.rstrip('/')}/api/v1", "web_url": config.public_web_url, "environment": config.app_env})
+    return row
+
+
+@router.patch("/admin/settings", include_in_schema=False)
+def update_settings_early(body: RecruitmentSettingsUpdate, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_manage_team")
+    return _update_settings(body, actor, db)
+
+
 @router.get("/admin/{resource}")
-def admin_list(resource: str, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def admin_list(
+    resource: str,
+    limit: int = Query(default=500, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    sort: str = Query(default="oldest", pattern="^(oldest|latest)$"),
+    actor: Actor = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
     model = ADMIN_RESOURCES.get(resource)
     if not model:
         raise ApplicationError("RESOURCE_NOT_FOUND", "资源不存在", 404)
     statement = select(model)
     if hasattr(model, "company_id"):
         statement = statement.where(model.company_id == actor.company_id)
-    rows = db.scalars(statement.limit(500)).all()
-    output = [serialize(row) for row in rows]
-    for item in output:
-        for column in SENSITIVE_COLUMNS:
-            item.pop(column, None)
-    return output
+    statement = _scope_statement(resource, statement, actor, db)
+    if hasattr(model, "created_at"):
+        statement = statement.order_by((model.created_at.desc() if sort == "latest" else model.created_at.asc()), model.id.desc() if sort == "latest" else model.id.asc())
+    elif hasattr(model, "id"):
+        statement = statement.order_by(model.id.asc())
+    rows = db.scalars(statement.offset(offset).limit(limit)).all()
+    serialized = [admin_serialize(row) for row in rows]
+    if resource == "candidate-sources":
+        counts = _candidate_message_counts(db, [row.id for row in rows])
+        for row, data in zip(rows, serialized):
+            count, last_message_at = counts.get(row.id, (0, None))
+            data["message_sent_count"] = count
+            data["last_message_sent_at"] = last_message_at
+    return serialized
 
 
-@router.get("/admin/mock-feishu/messages")
-def mock_feishu_messages(actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    recruiter_ids = select(Recruiter.id).where(Recruiter.company_id == actor.company_id)
-    rows = db.scalars(
-        select(MockFeishuMessage).where(MockFeishuMessage.recipient_recruiter_id.in_(recruiter_ids)).order_by(MockFeishuMessage.created_at.desc())
-    ).all()
-    return [serialize(row) for row in rows]
-
-
-@router.get("/admin/candidate-sources/{source_id}")
-def candidate_source_detail(source_id: str, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
-    row = db.get(CandidateSource, source_id)
-    if not row or row.company_id != actor.company_id:
-        raise ApplicationError("CANDIDATE_NOT_FOUND", "候选人来源不存在", 404)
-    data = serialize(row)
-    data["events"] = [
-        serialize(item)
-        for item in db.scalars(
-            select(RecruitmentEvent).where(RecruitmentEvent.candidate_source_id == source_id).order_by(RecruitmentEvent.event_time.desc())
-        ).all()
-    ]
-    data["interviews"] = [
-        serialize(item)
-        for item in db.scalars(select(Interview).where(Interview.candidate_source_id == source_id).order_by(Interview.scheduled_at.desc())).all()
-    ]
-    return data
+def _admin_row(resource: str, row_id: str, actor: Actor, db: Session):
+    model = ADMIN_RESOURCES.get(resource)
+    if not model:
+        raise ApplicationError("RESOURCE_NOT_FOUND", "资源不存在", 404)
+    row = db.get(model, row_id)
+    if not row or hasattr(row, "company_id") and row.company_id != actor.company_id or not _row_visible_to_actor(resource, row, actor, db):
+        raise ApplicationError("RESOURCE_NOT_FOUND", "资源不存在", 404)
+    return row
 
 
 @router.patch("/admin/unmapped-jobs/{unmapped_id}")
 def map_unmapped_job(unmapped_id: str, body: dict[str, str], actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_manage_jobs")
     row = db.get(UnmappedJob, unmapped_id)
     job = db.get(RecruitmentJob, body.get("job_id", ""))
     if not row or row.company_id != actor.company_id or not job or job.company_id != actor.company_id:
@@ -1154,8 +2241,87 @@ def map_unmapped_job(unmapped_id: str, body: dict[str, str], actor: Actor = Depe
     return {**serialize(row), "backfilled_candidate_count": backfilled}
 
 
+@router.patch("/admin/{resource}/{row_id}")
+def admin_update(resource: str, row_id: str, body: dict[str, Any], actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = _admin_row(resource, row_id, actor, db)
+    if resource in {"recruiters", "accounts", "devices"}:
+        _require_capability(db, actor, "can_manage_team")
+    if resource in {"jobs", "job-aliases", "unmapped-jobs"}:
+        _require_capability(db, actor, "can_manage_jobs")
+    allowed = ADMIN_EDITABLE_FIELDS.get(resource, set())
+    unknown = set(body) - allowed
+    if unknown:
+        raise ApplicationError("FIELD_NOT_EDITABLE", f"字段不可编辑：{', '.join(sorted(unknown))}", 400)
+    if resource == "recruiters" and "role" in body and body["role"] not in {"ADMIN", "HR_MANAGER", "RECRUITER"}:
+        raise ApplicationError("INVALID_ROLE", "角色无效", 400)
+    if "status" in body and body["status"] not in {"ACTIVE", "DISABLED", "REVOKED", "ARCHIVED"}:
+        raise ApplicationError("INVALID_STATUS", "状态无效", 400)
+    for key, value in body.items():
+        if key == "password":
+            if value:
+                row.password_hash = hash_password(str(value))
+        elif hasattr(row, key):
+            setattr(row, key, value)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApplicationError("RESOURCE_CONFLICT", "保存失败：数据与现有记录冲突", 409) from exc
+    return admin_serialize(row)
+
+
+@router.delete("/admin/{resource}/{row_id}")
+def admin_delete(resource: str, row_id: str, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, bool]:
+    if resource not in ADMIN_DELETABLE_RESOURCES:
+        raise ApplicationError("RESOURCE_DELETE_NOT_ALLOWED", "该类业务记录不能通过通用接口删除", 405)
+    row = _admin_row(resource, row_id, actor, db)
+    if resource in {"recruiters", "accounts", "devices"}:
+        _require_capability(db, actor, "can_manage_team")
+    if resource in {"jobs", "job-aliases", "unmapped-jobs"}:
+        _require_capability(db, actor, "can_manage_jobs")
+    db.delete(row)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApplicationError("RESOURCE_IN_USE", "该记录仍被业务数据引用，无法直接删除；请先处理关联记录", 409) from exc
+    return {"success": True}
+
+
+@router.get("/admin/mock-feishu/messages")
+def mock_feishu_messages(actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    recruiter_ids = select(Recruiter.id).where(Recruiter.company_id == actor.company_id)
+    rows = db.scalars(
+        select(MockFeishuMessage).where(MockFeishuMessage.recipient_recruiter_id.in_(recruiter_ids)).order_by(MockFeishuMessage.created_at.desc())
+    ).all()
+    return [serialize(row) for row in rows]
+
+
+@router.get("/admin/candidate-sources/{source_id}")
+def candidate_source_detail(source_id: str, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = db.get(CandidateSource, source_id)
+    if not row or row.company_id != actor.company_id or not _row_visible_to_actor("candidate-sources", row, actor, db):
+        raise ApplicationError("CANDIDATE_NOT_FOUND", "候选人来源不存在", 404)
+    data = serialize(row)
+    message_count, last_message_at = _candidate_message_counts(db, [source_id]).get(source_id, (0, None))
+    data["message_sent_count"] = message_count
+    data["last_message_sent_at"] = last_message_at
+    data["events"] = [
+        serialize(item)
+        for item in db.scalars(
+            select(RecruitmentEvent).where(RecruitmentEvent.candidate_source_id == source_id).order_by(RecruitmentEvent.event_time.desc())
+        ).all()
+    ]
+    data["interviews"] = [
+        serialize(item)
+        for item in db.scalars(select(Interview).where(Interview.candidate_source_id == source_id).order_by(Interview.scheduled_at.desc())).all()
+    ]
+    return data
+
+
 @router.post("/admin/jobs")
 def create_job(body: JobCreate, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_manage_jobs")
     row = RecruitmentJob(company_id=actor.company_id, **body.model_dump())
     db.add(row)
     db.commit()
@@ -1164,6 +2330,7 @@ def create_job(body: JobCreate, actor: Actor = Depends(require_admin), db: Sessi
 
 @router.post("/admin/job-aliases")
 def create_alias(body: AliasCreate, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_manage_jobs")
     job = db.get(RecruitmentJob, body.job_id)
     if not job or job.company_id != actor.company_id:
         raise ApplicationError("JOB_NOT_FOUND", "目标岗位不存在", 404)
@@ -1181,10 +2348,21 @@ def create_alias(body: AliasCreate, actor: Actor = Depends(require_admin), db: S
 
 @router.post("/admin/recruiters")
 def create_recruiter(body: RecruiterCreate, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_manage_team")
     if body.role not in {"ADMIN", "HR_MANAGER", "RECRUITER"}:
         raise ApplicationError("INVALID_ROLE", "角色无效")
     row = Recruiter(company_id=actor.company_id, display_name=body.display_name, email=body.email, role=body.role, password_hash=hash_password(body.password))
     db.add(row)
+    db.flush()
+    db.add(RecruiterAccessProfile(
+        company_id=actor.company_id,
+        recruiter_id=row.id,
+        data_scope="COMPANY" if body.role == "ADMIN" else "OWN",
+        can_manage_team=body.role == "ADMIN",
+        can_manage_feishu=body.role == "ADMIN",
+        can_manage_jobs=body.role == "ADMIN",
+        can_reset_system=body.role == "ADMIN",
+    ))
     db.commit()
     data = serialize(row)
     data.pop("password_hash")
@@ -1193,6 +2371,7 @@ def create_recruiter(body: RecruiterCreate, actor: Actor = Depends(require_admin
 
 @router.post("/admin/accounts")
 def create_account(body: AccountCreate, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_capability(db, actor, "can_manage_team")
     recruiter = db.get(Recruiter, body.recruiter_id)
     if not recruiter or recruiter.company_id != actor.company_id:
         raise ApplicationError("RECRUITER_NOT_FOUND", "招聘者不存在", 404)
@@ -1217,16 +2396,7 @@ def notification_action(notification_id: str, action: str, actor: Actor = Depend
     return {"success": True}
 
 
-@router.get("/admin/settings")
-def settings(actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
-    row = serialize(_company_settings(db, actor.company_id))
-    config = get_settings()
-    row.update({"api_base_url": f"{config.public_web_url.rstrip('/')}/api/v1", "web_url": config.public_web_url, "environment": config.app_env})
-    return row
-
-
-@router.patch("/admin/settings")
-def update_settings(body: RecruitmentSettingsUpdate, actor: Actor = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+def _update_settings(body: RecruitmentSettingsUpdate, actor: Actor, db: Session) -> dict[str, Any]:
     row = _company_settings(db, actor.company_id)
     before = serialize(row)
     if body.notify_on_contact is not None:

@@ -1,4 +1,5 @@
 import { apiRequest } from "./api-client";
+import { getAuth } from "./auth-store";
 import {
   enqueueBounded,
   readStoredQueue,
@@ -39,10 +40,14 @@ export async function queueMessageSent(payload: unknown): Promise<void> {
 }
 
 export async function flushMessageQueue(): Promise<void> {
+  const session = await getAuth();
+  if (!session.accessToken) return;
   const queue = await readStoredQueue(STORAGE_KEY, isPayload);
   if (!queue.length) return;
   const remaining: MessagePayload[] = [];
   for (let index = 0; index < queue.length; index++) {
+    const current = await getAuth();
+    if (!current.accessToken || current.deviceId !== session.deviceId) return;
     const payload = queue[index];
     try {
       await apiRequest("/plugin/engagements/message-sent", {

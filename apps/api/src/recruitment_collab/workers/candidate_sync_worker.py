@@ -10,9 +10,10 @@ from sqlalchemy import or_, select
 from recruitment_collab.config.settings import get_settings
 from recruitment_collab.infrastructure.bitable import BitableSyncClient
 from recruitment_collab.infrastructure.database import SessionLocal
-from recruitment_collab.infrastructure.models import CandidateSource, CandidateSyncOutbox, now
+from recruitment_collab.infrastructure.models import CandidateSource, CandidateSyncOutbox, FeishuBitableConfig, RecruitmentSetting, now
 from recruitment_collab.workers.heartbeat import record_worker_heartbeat
 from recruitment_collab.workers.retry import schedule_retry
+from recruitment_collab.workers.company_daily_worker import process_batch as process_daily_batch
 
 PROCESSING_TIMEOUT_MINUTES = 5
 
@@ -20,6 +21,7 @@ PROCESSING_TIMEOUT_MINUTES = 5
 @dataclass(frozen=True)
 class ClaimedSync:
     row_id: str
+    company_id: str
     payload_version: int
     payload: dict[str, Any]
     record_id: str | None
@@ -44,9 +46,12 @@ def _claim_next() -> ClaimedSync | None:
         row = session.scalar(statement)
         if not row:
             return None
+        setting = session.scalar(select(RecruitmentSetting).where(RecruitmentSetting.company_id == row.company_id))
+        if setting and setting.reset_in_progress:
+            return None
         row.status = "PROCESSING"
         source = session.get(CandidateSource, row.candidate_source_id)
-        claimed = ClaimedSync(row.id, row.payload_version, dict(row.payload_json), source.feishu_record_id if source else None)
+        claimed = ClaimedSync(row.id, row.company_id, row.payload_version, dict(row.payload_json), source.feishu_record_id if source else None)
         session.commit()
         return claimed
 
@@ -82,13 +87,19 @@ def _fail(task: ClaimedSync, error: Exception) -> None:
 def process_batch(limit: int = 20) -> int:
     """Synchronize due rows without making the message-sent API wait on Feishu."""
     settings = get_settings()
-    client = BitableSyncClient(settings)
     processed = 0
     while processed < limit:
         task = _claim_next()
         if not task:
             break
         try:
+            with SessionLocal() as session:
+                config = session.scalar(select(FeishuBitableConfig).where(FeishuBitableConfig.company_id == task.company_id, FeishuBitableConfig.status == "ACTIVE"))
+            client = BitableSyncClient(
+                settings,
+                app_token=config.app_token if config else None,
+                candidate_table_id=config.candidate_table_id if config else None,
+            )
             _status, synced_record_id = client.upsert_candidate(task.payload, task.record_id)
             _complete(task, synced_record_id)
         except Exception as exc:
@@ -101,6 +112,7 @@ async def main() -> None:
     while True:
         try:
             processed = process_batch()
+            processed += process_daily_batch()
             record_worker_heartbeat("candidate-sync-worker", processed)
         except Exception as exc:
             record_worker_heartbeat("candidate-sync-worker", error_code=type(exc).__name__, force=True)

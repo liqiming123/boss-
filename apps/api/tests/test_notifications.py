@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker
 
 from recruitment_collab.config.settings import get_settings
 from recruitment_collab.infrastructure.database import Base
-from recruitment_collab.infrastructure.feishu import FeishuCallbackVerifier
+from recruitment_collab.infrastructure.feishu import FeishuCallbackVerifier, FeishuCardBuilder, RealFeishuClient
 from recruitment_collab.infrastructure.models import Company, MockFeishuMessage, NotificationOutbox, Recruiter
 from recruitment_collab.infrastructure.security import hash_password
 from recruitment_collab.workers import notification_worker
@@ -21,6 +21,47 @@ def test_callback_signature_checks_freshness():
     assert not verifier.verify_signature("1", nonce, body, signature)
     assert verifier.verify_token("verify-token")
     assert not verifier.verify_token("wrong")
+
+
+def test_real_feishu_send_includes_json_content_type_and_provider_error():
+    class FakeResponse:
+        status_code = 400
+        reason_phrase = "Bad Request"
+        is_error = True
+
+        def json(self):
+            return {"code": 230002, "msg": "invalid receive_id"}
+
+    class FakeClient:
+        async def post(self, url, **kwargs):
+            assert kwargs["headers"]["Content-Type"] == "application/json; charset=utf-8"
+            assert kwargs["params"] == {"receive_id_type": "open_id"}
+            assert kwargs["json"]["msg_type"] == "interactive"
+            return FakeResponse()
+
+        async def aclose(self):
+            pass
+
+    async def exercise():
+        settings = get_settings().model_copy(update={"feishu_app_id": "app", "feishu_app_secret": "secret"})
+        client = RealFeishuClient(settings, FakeClient())
+        client._token, client._expires_at = "tenant-token", time.time() + 3600
+        try:
+            await client.send_card("ou-recipient", FeishuCardBuilder().duplicate_card({}))
+        except RuntimeError as exc:
+            assert "code=230002" in str(exc)
+            assert "invalid receive_id" in str(exc)
+        else:
+            raise AssertionError("expected Feishu provider error")
+        finally:
+            await client.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_duplicate_card_is_informational_without_actions():
+    card = FeishuCardBuilder().duplicate_card({"candidate_name": "小明"})
+    assert all(element.get("tag") != "action" for element in card["elements"])
 
 
 def test_mock_worker_delivers_and_persists_message(tmp_path, monkeypatch):

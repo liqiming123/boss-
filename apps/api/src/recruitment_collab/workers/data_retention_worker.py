@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
-from sqlalchemy import delete, update
+from sqlalchemy import case, delete, exists, select, update
 
 from recruitment_collab.config.settings import get_settings
 from recruitment_collab.infrastructure.database import SessionLocal
@@ -49,16 +49,34 @@ def process_retention() -> dict[str, int]:
             .where(CandidateSyncOutbox.status == "FAILED", CandidateSyncOutbox.updated_at < failed_before)
             .values(payload_json={}, last_error=None)
         )
+        # Keep a full candidate source while a sync worker can still use its
+        # source row.  Once the outbox is terminal (SENT/FAILED/CANCELLED) or
+        # missing, the normal candidate cache window also applies to sources
+        # that never obtained a Feishu record.  This bounds PII retention
+        # without deleting data needed by an active retry.
+        active_sync = exists(
+            select(CandidateSyncOutbox.id).where(
+                CandidateSyncOutbox.candidate_source_id == CandidateSource.id,
+                CandidateSyncOutbox.status.in_({"PENDING", "PROCESSING"}),
+            )
+        )
         minimized = session.execute(
             update(CandidateSource)
             .where(
-                CandidateSource.feishu_record_id.is_not(None),
                 CandidateSource.last_seen_at < current - timedelta(days=settings.candidate_cache_days),
                 CandidateSource.data_minimized_at.is_(None),
                 CandidateSource.snapshot_status != "PENDING",
+                # A source that has already been written to Feishu can still
+                # be minimized while a later field update is queued.  A
+                # never-synced source, however, must keep its full fields
+                # until an active retry has finished.
+                (CandidateSource.feishu_record_id.is_not(None) | ~active_sync),
             )
             .values(
-                candidate_display_name="已同步至飞书",
+                candidate_display_name=case(
+                    (CandidateSource.feishu_record_id.is_not(None), "已同步至飞书"),
+                    else_="已按保留期限最小化",
+                ),
                 candidate_normalized_name="",
                 candidate_age=None,
                 candidate_experience=None,
@@ -91,7 +109,11 @@ async def main() -> None:
         except Exception as exc:
             record_worker_heartbeat("data-retention-worker", error_code=type(exc).__name__, force=True)
             raise
-        for _ in range(120):
+        # Run the sweep once per configured maintenance interval (production
+        # defaults to monthly). Keep the heartbeat fresh while waiting so
+        # operators can distinguish an idle worker from a dead one.
+        interval_seconds = max(30, int(get_settings().retention_run_interval_days) * 24 * 60 * 60)
+        for _ in range((interval_seconds + 29) // 30):
             await asyncio.sleep(30)
             record_worker_heartbeat("data-retention-worker")
 

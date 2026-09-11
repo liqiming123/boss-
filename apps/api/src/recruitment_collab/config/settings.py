@@ -31,16 +31,35 @@ class Settings(BaseSettings):
     feishu_bitable_candidate_table_id: str = ""
     feishu_bitable_followup_table_id: str = ""
     plugin_company_code: str = ""
+    # Empty means the management console uses the same scope as the plugin:
+    # any active recruiter in the configured company. Set ADMIN_ROLES only
+    # when a deployment explicitly needs to narrow that scope.
+    admin_roles: List[str] = Field(default_factory=list)
     public_web_url: str = "http://localhost:5173"
     candidate_cache_days: int = 30
     diagnostic_retention_days: int = 30
     event_retention_days: int = 90
     audit_retention_days: int = 180
     failed_task_retention_days: int = 30
+    # Retention is intentionally a low-frequency maintenance job.  Individual
+    # retention windows above still control how much history is kept; this
+    # setting controls how often the database sweep runs.
+    retention_run_interval_days: int = 30
+    extension_package_path: str = "artifacts/recruitment-collab-extension.zip"
+    extension_release_metadata_path: str = "artifacts/extension-release.json"
 
     @field_validator("cors_origins", mode="before")
     @classmethod
     def split_origins(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("admin_roles", mode="before")
+    @classmethod
+    def split_admin_roles(cls, value: object) -> object:
+        if value is None or value == "":
+            return []
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
@@ -83,6 +102,7 @@ class Settings(BaseSettings):
             self.event_retention_days,
             self.audit_retention_days,
             self.failed_task_retention_days,
+            self.retention_run_interval_days,
         )
         if any(value <= 0 for value in retention):
             errors.append("所有数据保留期限必须大于 0")

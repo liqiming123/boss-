@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
@@ -29,8 +29,34 @@ class Company(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
 
 
+class FeishuBitableConfig(Base, TimestampMixin):
+    __tablename__ = "recruitment_feishu_bitable_configs"
+    __table_args__ = (Index("ix_feishu_bitable_config_company_status", "company_id", "status"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    table_url: Mapped[str] = mapped_column(String(500))
+    app_token: Mapped[str] = mapped_column(String(120))
+    candidate_table_id: Mapped[str] = mapped_column(String(120))
+    table_name: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    validation_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    validated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    activated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_recruiters.id"), nullable=True)
+
+
 class Recruiter(Base, TimestampMixin):
     __tablename__ = "recruitment_recruiters"
+    __table_args__ = (
+        Index(
+            "uq_recruiter_company_feishu_open_id",
+            "company_id",
+            "feishu_open_id",
+            unique=True,
+            postgresql_where=text("feishu_open_id IS NOT NULL"),
+            sqlite_where=text("feishu_open_id IS NOT NULL"),
+        ),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
     company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
     display_name: Mapped[str] = mapped_column(String(100))
@@ -41,6 +67,18 @@ class Recruiter(Base, TimestampMixin):
     password_hash: Mapped[str] = mapped_column(String(300))
     role: Mapped[str] = mapped_column(String(30), default="RECRUITER")
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+
+
+class RecruiterAccessProfile(Base, TimestampMixin):
+    __tablename__ = "recruitment_recruiter_access_profiles"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    recruiter_id: Mapped[str] = mapped_column(ForeignKey("recruitment_recruiters.id"), unique=True, index=True)
+    data_scope: Mapped[str] = mapped_column(String(20), default="OWN")
+    can_manage_team: Mapped[bool] = mapped_column(Boolean, default=False)
+    can_manage_feishu: Mapped[bool] = mapped_column(Boolean, default=False)
+    can_manage_jobs: Mapped[bool] = mapped_column(Boolean, default=False)
+    can_reset_system: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class FeishuBindingAttempt(Base):
@@ -70,6 +108,26 @@ class RecruitmentAccount(Base, TimestampMixin):
     platform_account_key: Mapped[str] = mapped_column(String(200))
     account_display_name: Mapped[str] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+
+
+class BossAccountAssignment(Base, TimestampMixin):
+    """Current and historical Feishu ownership of a BOSS account."""
+    __tablename__ = "recruitment_boss_account_assignments"
+    __table_args__ = (
+        Index("uq_boss_assignment_active_account", "boss_account_id", unique=True, postgresql_where=text("status = 'ACTIVE'"), sqlite_where=text("status = 'ACTIVE'")),
+        Index("uq_boss_assignment_active_feishu", "company_id", "feishu_recruiter_id", unique=True, postgresql_where=text("status = 'ACTIVE' AND feishu_recruiter_id IS NOT NULL"), sqlite_where=text("status = 'ACTIVE' AND feishu_recruiter_id IS NOT NULL")),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    boss_account_id: Mapped[str] = mapped_column(ForeignKey("recruitment_accounts.id"), index=True)
+    feishu_recruiter_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_recruiters.id"), nullable=True, index=True)
+    feishu_open_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    feishu_display_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    assignment_version: Mapped[int] = mapped_column(Integer, default=1)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    unassigned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    replaced_by_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
 
 class RecruitmentJob(Base, TimestampMixin):
@@ -196,6 +254,55 @@ class RecruitmentEvent(Base):
     idempotency_key: Mapped[str] = mapped_column(String(100), unique=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class BossDailyMetric(Base, TimestampMixin):
+    """Daily counters read from the BOSS company recruitment dashboard."""
+    __tablename__ = "recruitment_boss_daily_metrics"
+    __table_args__ = (UniqueConstraint("company_id", "boss_account_id", "metric_date"), Index("ix_boss_daily_metric_date", "company_id", "metric_date"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    boss_account_id: Mapped[str] = mapped_column(ForeignKey("recruitment_accounts.id"), index=True)
+    metric_date: Mapped[str] = mapped_column(String(10))
+    boss_name: Mapped[str] = mapped_column(String(100))
+    boss_viewed_talent: Mapped[int] = mapped_column(Integer, default=0)
+    boss_started_chat: Mapped[int] = mapped_column(Integer, default=0)
+    boss_communication: Mapped[int] = mapped_column(Integer, default=0)
+    talent_viewed_boss: Mapped[int] = mapped_column(Integer, default=0)
+    talent_started_chat: Mapped[int] = mapped_column(Integer, default=0)
+    source_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class BossCompanyDailyConfig(Base, TimestampMixin):
+    __tablename__ = "boss_company_daily_configs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), unique=True)
+    collector_account_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_accounts.id"), nullable=True)
+    collector_name: Mapped[str] = mapped_column(String(100))
+    app_token: Mapped[str] = mapped_column(String(120))
+    table_id: Mapped[str] = mapped_column(String(120))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_collected_date: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    last_collected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BossCompanyDailyRow(Base, TimestampMixin):
+    __tablename__ = "boss_company_daily_rows"
+    __table_args__ = (UniqueConstraint("company_id", "metric_date", "boss_name"), Index("ix_company_daily_due", "status", "next_retry_at"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"))
+    collector_account_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recruitment_accounts.id"), nullable=True)
+    metric_date: Mapped[str] = mapped_column(String(10))
+    boss_name: Mapped[str] = mapped_column(String(100))
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON)
+    source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    feishu_record_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    last_error: Mapped[Optional[str]] = mapped_column(String(180), nullable=True)
 
 
 class Conflict(Base, TimestampMixin):
@@ -338,6 +445,21 @@ class RecruitmentSetting(Base, TimestampMixin):
     company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), unique=True)
     notify_on_contact: Mapped[bool] = mapped_column(Boolean, default=True)
     catchup_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    reset_in_progress: Mapped[bool] = mapped_column(Boolean, default=False)
+    reset_generation: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class SystemResetJob(Base, TimestampMixin):
+    __tablename__ = "recruitment_system_reset_jobs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), unique=True, index=True)
+    requested_by: Mapped[str] = mapped_column(ForeignKey("recruitment_recruiters.id"))
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    preview_version: Mapped[str] = mapped_column(String(64))
+    counts_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class PluginDiagnostic(Base):
