@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 
 from recruitment_collab.config.settings import Settings
-from recruitment_collab.domain.normalization import CandidateNameNormalizer, JobNameNormalizer
+from recruitment_collab.domain.normalization import CandidateNameNormalizer, JobNameNormalizer, normalize_education, normalize_experience
 
 
 class BitableSyncClient:
@@ -291,32 +291,59 @@ class BitableSyncClient:
         return app_match.group(1), table_id
 
     def find_system_candidates(
-        self, identity_signature: str | None, current_recruiter: str, candidate_name: str = "", job_name: str = "", canonical_job_name: str = ""
+        self, identity_signature: str | None, current_recruiter: str, candidate_name: str = "", job_name: str = "", canonical_job_name: str = "",
+        candidate_age: int | None = None, candidate_experience: str = "", candidate_education: str = "", current_boss_account: str = ""
     ) -> list[dict[str, Any]]:
-        """Read the Bitable directly; manual rows never participate in duplicate warnings."""
+        """Read the Bitable directly, using business columns only.
+
+        The candidate table deliberately holds no technical columns — no record
+        marker, no identity signature — because those are internal identifiers
+        that do not belong in the shared table. Matching therefore relies on
+        what a recruiter can see: the candidate's name, age, work years and
+        education, plus the Feishu account for ownership. Job titles are
+        deliberately excluded from the identity decision.
+        """
         if self.settings.feishu_mode != "real":
             return []
         with httpx.Client(timeout=15) as client:
             headers = self._headers(client)
             records = []
             normalized_name = CandidateNameNormalizer().normalize(candidate_name)
-            normalized_jobs = {JobNameNormalizer().normalize(value) for value in (job_name, canonical_job_name) if value}
             for row in self._record_pages(client, headers):
                 fields = row.get("fields", {})
-                if not self.plain_value(fields.get("系统记录标识")):
-                    continue
+                # A colleague row always records whose account and job it is;
+                # an unscoped or unnamed row cannot be attributed to anyone and
+                # is skipped instead of guessing.
                 recruiter = self.plain_value(fields.get("飞书账号") or fields.get("当前招聘者")).strip()
-                if not recruiter or recruiter == current_recruiter.strip():
+                if not recruiter or (not current_boss_account and recruiter == current_recruiter.strip()):
                     continue
-                exact = bool(identity_signature) and self.plain_value(fields.get("候选人身份签名")) == identity_signature
                 row_name = CandidateNameNormalizer().normalize(self.plain_value(fields.get("候选人")))
-                row_jobs = {
-                    JobNameNormalizer().normalize(self.plain_value(fields.get(name))) for name in ("BOSS岗位", "标准岗位") if self.plain_value(fields.get(name))
-                }
-                same_name_job = bool(normalized_name and normalized_jobs and row_name == normalized_name and not normalized_jobs.isdisjoint(row_jobs))
-                if not exact and not same_name_job:
+                row_age = self.plain_value(fields.get("年龄"))
+                row_experience = self.plain_value(fields.get("工作年限"))
+                row_education = self.plain_value(fields.get("学历"))
+                signature_exact = bool(
+                    identity_signature
+                    and self.plain_value(fields.get("候选人身份签名")) == identity_signature
+                    and self.plain_value(fields.get("系统记录标识"))
+                )
+                exact = signature_exact or bool(
+                    normalized_name
+                    and row_name == normalized_name
+                    and candidate_age is not None
+                    and row_age == str(candidate_age)
+                    and normalize_experience(row_experience) == normalize_experience(candidate_experience)
+                    and normalize_education(row_education) == normalize_education(candidate_education)
+                )
+                if not exact:
                     continue
-                records.append({"record_id": row.get("record_id"), "match_level": "EXACT_IDENTITY" if exact else "SUSPECTED_SAME_NAME_JOB", **fields})
+                row_boss = self.plain_value(fields.get("BOSS账号"))
+                row_job = self.plain_value(fields.get("BOSS岗位") or fields.get("标准岗位"))
+                normalized_current_jobs = {JobNameNormalizer().normalize(value) for value in (job_name, canonical_job_name) if value}
+                same_account = bool(current_boss_account) and row_boss == current_boss_account.strip()
+                same_job = bool(row_job) and JobNameNormalizer().normalize(row_job) in normalized_current_jobs
+                if same_account and same_job:
+                    continue
+                records.append({"record_id": row.get("record_id"), "match_level": "EXACT_IDENTITY", **fields})
             return records
 
     def upload_snapshot(self, file_name: str, content: bytes) -> str:

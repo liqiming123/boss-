@@ -133,14 +133,35 @@ export function bossConversationEvidenceText(pageText: string): string {
   return marker >= 0 ? normalized.slice(marker) : "";
 }
 
+/** Conversation-region chrome: quick actions, system labels and controls that
+ * are rendered right-aligned like a recruiter bubble but are not a message.
+ * Classifying them as text is what turned the “不合适” button into a rejection
+ * that then locked a candidate out of 已约面. */
+const CHAT_UI_TEXT =
+  /^(?:不合适|求简历|换电话|换微信|查看面试|发送|在线简历|附件简历|举报|屏蔽|发送了面试邀请|你撤回了一条消息|以上是打招呼的内容|沟通职位|我的沟通|同事沟通|面试|电话|微信|简历)$/;
+
+/** Text that cannot be a message body: chrome, controls or a status label. */
+export function isBossChatUiText(value: string): boolean {
+  const text = normalizeBossText(value).replace(/[：:]\s*$/, "").trim();
+  if (!text) return true;
+  if (CHAT_UI_TEXT.test(text)) return true;
+  if (text.length <= 8 && /^(?:不合适|求简历|换电话|换微信|查看面试|在线简历|附件简历|发送|沟通职位)$/.test(text)) {
+    return true;
+  }
+  return /点击(?:预览|查看)|请输入|请选择|暂无更多|加载中|没有更多/.test(text);
+}
+
 /** Detect recruiter-side bubbles when BOSS does not render “送达”. */
 export function bossOutgoingBubbleText(): string {
   const region = findBossConversationRegion() || fallbackConversationRegion();
   if (!region) return "";
   const root = region.getBoundingClientRect();
   const bubbles = [...region.querySelectorAll<HTMLElement>("div,li,p")].filter((node) => {
+    // A message bubble is never an interactive control.
+    if (interactive(node)) return false;
     const text = normalizeBossText(node.innerText || node.textContent || "");
     if (text.length < 1 || text.length > 500) return false;
+    if (isBossChatUiText(text)) return false;
     const rect = node.getBoundingClientRect();
     if (!rect.width || !rect.height || rect.width > root.width * 0.9) return false;
     const style = getComputedStyle(node);

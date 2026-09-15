@@ -1,7 +1,10 @@
 import type { StatusEvidence } from "../types";
 import { normalizeBossText } from "./boss-normalizers";
 
-export const BOSS_STATUS_RULE_VERSION = "boss-status-v6";
+// v7: the conversation's newest signal decides the status, page chrome such as
+// the “不合适” action button is no longer read as a rejection, and a newer
+// interview invitation supersedes an older rejection.
+export const BOSS_STATUS_RULE_VERSION = "boss-status-v7";
 
 /** BOSS's own confirmation that an interview invitation reached the candidate.
  * The current desktop build renders the system bubble 「发送了面试邀请」 in the
@@ -44,6 +47,58 @@ export function bossInterviewInviteEvidence(
 const EXPLICIT_REJECTION =
   /(?:(?:不太?合适|不合适|暂不合适|不匹配|不符合(?:岗位|职位|要求|需求)?|暂(?:时)?不考虑|不再考虑|不予考虑|不通过|无法(?:继续)?推进|不再推进|先不推进|暂停推进|婉拒|岗位(?:已经?)?招满|很遗憾.{0,18}(?:不能|无法|不予))|(?:对不起|抱歉).{0,80}(?:不太?合适|不合适|不匹配|不考虑))/;
 
+/** Text that looks like a rejection keyword but belongs to the page, not to a
+ * message. BOSS renders a “不合适” action button inside the conversation
+ * region, and recruiters write politeness such as “觉得不合适可以告诉我”
+ * that is not a rejection. Neither may drive 已拒绝. */
+const REJECTION_FALSE_POSITIVE =
+  /(?:觉得|如果|假如|要是|如有|倘若)[^。；;]{0,12}不合适|不合适[^。；;]{0,12}(?:可以|请|随时|告诉|说|联系|点击|按钮)|不合适的话|不合适也(?:没关系|没事)/;
+
+function looksLikeRejectionTemplate(text: string): boolean {
+  if (REJECTION_FALSE_POSITIVE.test(text)) return false;
+  // A bare “不合适” is the page's own action button, not a rejection. A
+  // rejection is a statement: it carries a delivery marker, a pronoun/reason,
+  // a closing wish, or it uses a category phrase that is never a button label.
+  const bareButtonOnly =
+    /^(?:不|不太|暂不|还不)合适$/.test(text) && !/送达|看了|简历|祝你|希望你/.test(text);
+  return !bareButtonOnly;
+}
+
+/** True when a candidate-declined interview is the newest signal. BOSS shows
+ * “拒接了面试邀请”; it must outrank an invitation sent earlier, otherwise the
+ * row would keep claiming 已约面 after the candidate declined. */
+const INTERVIEW_DECLINED =
+  /(?:拒接了?面试邀请|拒绝了?面试邀请|候选人已拒绝|已拒绝面试邀请)/;
+
+/** Combine the two representations of the same conversation into one status.
+ *
+ * The old rule was "a rejection found anywhere wins", which let an older
+ * rejection phrase — or BOSS's own “不合适” action button, which the bubble
+ * detector used to misread as a recruiter message — permanently outrank the
+ * interview invitation the recruiter sent afterwards.
+ *
+ * Instead the winner is the last signal of each representation, and the
+ * passive conversation text wins ties because it is the whole conversation
+ * rather than only the bubbles that could be classified as outbound.
+ */
+export function resolveBossStatusEvidence(
+  passive: StatusEvidence | null,
+  outgoing: StatusEvidence | null,
+): StatusEvidence {
+  const passiveSignal =
+    passive && !(passive.status === "沟通中" && passive.evidence === "RECRUITER_OUTBOUND")
+      ? passive
+      : null;
+  const outgoingSignal =
+    outgoing && outgoing.status !== "沟通中" ? outgoing : null;
+  return passiveSignal || outgoingSignal || passive || outgoing || {
+    status: "沟通中",
+    evidence: "RECRUITER_OUTBOUND",
+    ruleVersion: BOSS_STATUS_RULE_VERSION,
+    observedAt: new Date().toISOString(),
+  };
+}
+
 const DELIVERED_REJECTION = new RegExp(
   `(?:${EXPLICIT_REJECTION.source}.{0,50}送达|送达.{0,50}${EXPLICIT_REJECTION.source})`,
 );
@@ -56,7 +111,7 @@ const RULES: Array<{ status: string; pattern: RegExp; evidence: string }> = [
   },
   {
     status: "已拒绝",
-    pattern: new RegExp(`(?:已拒绝该候选人|${DELIVERED_REJECTION.source})`),
+    pattern: new RegExp(`(?:${INTERVIEW_DECLINED.source}|已拒绝该候选人|${DELIVERED_REJECTION.source})`),
     evidence: "EXPLICIT_REJECTION",
   },
   {
@@ -87,17 +142,29 @@ export function classifyBossStatus(
   const rules = includeInterviewIntent
     ? [...RULES, { status: "待约面", pattern: /(?:可以面试|方便.{0,12}面试|想约.{0,8}面试|安排.{0,8}面试)/, evidence: "INTERVIEW_INTENT" }]
     : RULES;
-  const rule = rules.map((item) => {
-    const matches = [
-      ...normalized.matchAll(
-        new RegExp(
-          item.pattern.source,
-          `${item.pattern.flags.replace("g", "")}g`,
+  const rule = rules
+    .map((item) => {
+      const rawMatches = [
+        ...normalized.matchAll(
+          new RegExp(
+            item.pattern.source,
+            `${item.pattern.flags.replace("g", "")}g`,
+          ),
         ),
-      ),
-    ];
-    return { item, index: matches.at(-1)?.index ?? -1 };
-  })
+      ];
+      // A rejection keyword inside page chrome or recruiter politeness is not
+      // a rejection; drop those hits so a later/earlier real signal can win.
+      const matches =
+        item.evidence === "EXPLICIT_REJECTION"
+          ? rawMatches.filter((match) => {
+              if (INTERVIEW_DECLINED.test(match[0])) return true;
+              const start = Math.max(0, (match.index ?? 0) - 24);
+              const context = normalized.slice(start, (match.index ?? 0) + match[0].length + 24);
+              return looksLikeRejectionTemplate(context);
+            })
+          : rawMatches;
+      return { item, index: matches.at(-1)?.index ?? -1 };
+    })
     .filter((value) => value.index >= 0)
     .sort((a, b) => b.index - a.index)[0]?.item;
   return {
@@ -117,7 +184,12 @@ export function classifyBossOutgoingMessage(
   observedAt = new Date().toISOString(),
 ): StatusEvidence {
   const normalized = normalizeBossText(text);
-  if (EXPLICIT_REJECTION.test(normalized))
+  // A confirmed outbound bubble still needs real rejection wording: “觉得不
+  // 合适可以告诉我” is politeness, and a bare “不合适” may be page chrome.
+  if (
+    EXPLICIT_REJECTION.test(normalized) &&
+    (INTERVIEW_DECLINED.test(normalized) || looksLikeRejectionTemplate(normalized))
+  )
     return {
       status: "已拒绝",
       evidence: "EXPLICIT_REJECTION",
@@ -129,26 +201,6 @@ export function classifyBossOutgoingMessage(
     return { ...intent, evidence: "RECRUITER_RECONTACT_INTENT" };
   }
   return classifyBossStatus(normalized, observedAt, true);
-}
-
-/** Only an explicit interview scheduling action justifies the intrusive
- * historical chat capture. Opening a conversation, chatting, or merely
- * expressing interview intent must never hijack the recruiter's scroll
- * position. */
-const INVITE_EVIDENCE = new Set(["BOSS_INTERVIEW_MARKER", "BOSS_INTERVIEW_INVITE"]);
-
-/** True when the outgoing message hands the candidate an interview invitation.
- * A question such as “方便面试吗” is only intent (待约面) and is deliberately
- * excluded: the state change we must document is the actual invitation. */
-export function isBossInviteScreenshotTrigger(
-  messageText: string | undefined,
-  statusEvidence?: StatusEvidence,
-): boolean {
-  if (statusEvidence) {
-    if (statusEvidence.status === INVITE_STATUS) return true;
-    if (INVITE_EVIDENCE.has(statusEvidence.evidence)) return true;
-  }
-  return !!messageText && classifyBossOutgoingMessage(messageText).status === INVITE_STATUS;
 }
 
 export function hasBossRecruiterOutbound(text: string): boolean {

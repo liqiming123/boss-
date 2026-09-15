@@ -1,10 +1,11 @@
 import { ApiClient } from "@recruitment/api-client";
 import { clearAuth, getAuth, setAuth, type AuthState } from "./auth-store";
-async function refreshAccess(auth: AuthState) {
+async function refreshAccess(auth: AuthState, signal?: AbortSignal) {
   if (!auth.refreshToken) return null;
   const response = await fetch(`${auth.apiBaseUrl}/auth/refresh`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal,
     body: JSON.stringify({
       refresh_token: auth.refreshToken,
       device_id: auth.deviceId,
@@ -28,7 +29,7 @@ function authenticatedClient(auth: AuthState) {
   return new ApiClient(
     auth.apiBaseUrl,
     () => token,
-    async () => (token = await refreshAccess(auth)),
+    async (signal) => (token = await refreshAccess(auth, signal)),
     () => void clearAuth(),
   );
 }

@@ -74,6 +74,11 @@ def test_conversation_sync_persists_every_clicked_candidate_without_faking_messa
     assert first.status_code == 200
     assert first.json()["candidate_source_id"]
     assert first.json()["sync_trigger"] == "CANDIDATE_OPENED"
+    # Clicking a candidate synchronizes the shared table row, but a look is
+    # still not a follow-up: no engagement, no MESSAGE_SENT and no screenshot —
+    # images are captured by the history sweep, never mid-typing.
+    assert first.json()["feishu_sync_status"] == "QUEUED"
+    assert first.json()["snapshot_needed"] is False
     assert session.scalar(select(func.count()).select_from(CandidateSource)) == 1
     assert session.scalar(select(func.count()).select_from(CandidateSyncOutbox)) == 1
     assert session.scalar(select(func.count()).select_from(Engagement)) == 0
@@ -86,6 +91,8 @@ def test_conversation_sync_persists_every_clicked_candidate_without_faking_messa
     repeat_payload = {**first_payload, "client_event_id": str(uuid.uuid4())}
     repeat = client.post("/api/v1/plugin/conversations/sync", json=repeat_payload)
     assert repeat.status_code == 200
+    # Nothing moved: re-opening the same conversation writes nothing, and the
+    # row already has an image so no second capture is requested.
     assert repeat.json()["feishu_sync_status"] == "UNCHANGED"
     assert session.scalar(select(func.count()).select_from(CandidateSyncOutbox)) == 1
 
@@ -97,8 +104,13 @@ def test_conversation_sync_persists_every_clicked_candidate_without_faking_messa
     }
     newer = client.post("/api/v1/plugin/conversations/sync", json=newer_payload)
     assert newer.status_code == 200
+    # A newer message time refreshes the existing row instead of being dropped.
     assert newer.json()["feishu_sync_status"] == "QUEUED"
     assert session.scalar(select(func.count()).select_from(CandidateSyncOutbox)) == 1
+    queued = session.scalar(select(CandidateSyncOutbox))
+    assert queued.payload_json["更新时间"] == int(datetime(2026, 9, 2, 2, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    assert session.scalar(select(func.count()).select_from(Engagement)) == 0
+    assert session.scalar(select(func.count()).select_from(RecruitmentEvent)) == 0
 
     second_payload = {
         **context("点击即同步", "珈莉", "clicked-second"),
@@ -164,7 +176,10 @@ def test_boss_native_history_is_confirmed_without_creating_a_feishu_row(client, 
     assert response.status_code == 200
     data = response.json()
     assert data["result_type"] == "CONFIRMED_DUPLICATE"
-    assert [(item["recruiter_name"], item["job_name"], item["stage"]) for item in data["matches"]] == [("王文懋", "总经理助理", "飞书未同步")]
+    assert {(item["recruiter_name"], item["job_name"], item["stage"]) for item in data["matches"]} == {
+        ("王文懋", "总经理助理", "飞书未同步"),
+        ("成珈莉", "业务助理", "飞书未同步"),
+    }
     assert data["matches"][0]["evidence_source"] == "BOSS_NATIVE"
     assert data["matches"][0]["feishu_synced"] is False
     assert session.scalar(select(func.count()).select_from(CandidateSource)) == 0
@@ -186,15 +201,15 @@ def test_boss_native_history_enriches_matching_system_history_without_duplicatio
     assert matches[0]["feishu_synced"] is True
 
 
-def test_incomplete_four_field_identity_can_only_be_same_name_job_suspected(client, session):
+def test_incomplete_four_field_identity_does_not_match_by_name_or_job(client, session):
     first = message_sent(client, {}, context("同名候选人", "谢女士", "first"))
     assert first.status_code == 200
     incomplete = context("同名候选人", "珈莉", "second")
     incomplete["candidate_education"] = None
     result = client.post("/api/v1/plugin/context/check", json=incomplete)
     assert result.status_code == 200
-    assert result.json()["result_type"] == "SUSPECTED_DUPLICATE"
-    assert result.json()["matches"][0]["match_level"] == "SUSPECTED_SAME_NAME_JOB"
+    assert result.json()["result_type"] == "CHECK_ONLY_NO_HISTORY"
+    assert result.json()["matches"] == []
 
 
 def test_transient_missing_profile_fields_do_not_erase_existing_candidate_data(client, session):
@@ -289,7 +304,7 @@ def test_invitation_without_a_resolved_schedule_creates_no_interview(client, ses
     assert session.scalars(select(Interview)).all() == []
 
 
-def test_click_exact_identity_warns_only_the_viewer_with_cooldown(client, session):
+def test_click_exact_identity_warns_latest_recruiter_with_cooldown(client, session):
     xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
     recruiters = session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all()
     for recruiter in recruiters:
@@ -301,15 +316,16 @@ def test_click_exact_identity_warns_only_the_viewer_with_cooldown(client, sessio
     first = client.post("/api/v1/plugin/context/check", headers=jiali, json=payload)
     assert first.status_code == 200
     assert first.json()["result_type"] == "CONFIRMED_DUPLICATE"
-    # Browsing warns the viewer only. The recruiter who already contacted the
-    # candidate must not be pinged for a colleague merely opening the profile.
+    # With no newer communication time on the viewer, the recruiter holding
+    # the latest real conversation receives the single alert.
     assert first.json()["lookup_notifications_queued"] == 1
     alert = session.scalar(select(DuplicateLookupAlert))
     assert alert is not None and alert.matched_recruiter_id == xie_recruiter.id
     queued = session.scalars(select(NotificationOutbox)).all()
     assert len(queued) == 1
-    assert queued[0].recipient_recruiter_id != xie_recruiter.id
-    assert queued[0].payload_json["current_action"] == "你正在查看该候选人，尚未确认发送消息"
+    assert queued[0].recipient_recruiter_id == xie_recruiter.id
+    assert queued[0].payload_json["current_recruiter_status"] == "待建立跟进记录"
+    assert queued[0].payload_json["candidate_status"] == "沟通中"
     repeat = client.post("/api/v1/plugin/context/check", headers=jiali, json={**payload, "client_event_id": str(uuid.uuid4())})
     assert repeat.status_code == 200
     assert repeat.json()["lookup_notifications_queued"] == 0
@@ -354,11 +370,10 @@ def test_feishu_recruiter_label_resolves_bound_identity_before_legacy_display_na
 
     alert = session.scalar(select(DuplicateLookupAlert))
     recipients = set(session.scalars(select(NotificationOutbox.recipient_recruiter_id)).all())
-    # The alert still records which recruiter already owns the candidate, but a
-    # browse only warns the viewer.
+    # The bound recruiter owns the latest known conversation and receives it.
     assert queued == 1
     assert alert.matched_recruiter_id == bound.id
-    assert recipients == {viewer.id}
+    assert recipients == {bound.id}
     assert legacy.id not in recipients
 
 
@@ -423,8 +438,8 @@ def test_click_evidence_upgrade_bypasses_cooldown(client, session):
     current_payload = context("升级证据候选人", "珈莉", "upgrade-second")
     current_payload["candidate_age"] = 31
     suspected = client.post("/api/v1/plugin/context/check", headers=jiali, json=current_payload)
-    assert suspected.json()["result_type"] == "SUSPECTED_DUPLICATE"
-    assert suspected.json()["lookup_notifications_queued"] == 1
+    assert suspected.json()["result_type"] == "CHECK_ONLY_NO_HISTORY"
+    assert suspected.json()["lookup_notifications_queued"] == 0
     source = session.get(CandidateSource, source_id)
     source.candidate_age = 31
     source.candidate_identity_signature = candidate_identity_signature("升级证据候选人", 31, "6年", "本科")
@@ -433,13 +448,11 @@ def test_click_evidence_upgrade_bypasses_cooldown(client, session):
     assert upgraded.json()["result_type"] == "CONFIRMED_DUPLICATE"
     assert upgraded.json()["lookup_notifications_queued"] == 1
     alert = session.scalar(select(DuplicateLookupAlert))
-    assert alert.evidence_rank == 2 and alert.notification_version == 2
-    # Each evidence version warns the viewer once; the other recruiter is never
-    # pinged for a browse.
-    assert session.scalar(select(func.count()).select_from(NotificationOutbox)) == 2
+    assert alert.evidence_rank == 2 and alert.notification_version == 1
+    assert session.scalar(select(func.count()).select_from(NotificationOutbox)) == 1
 
 
-def test_boss_native_history_warns_only_the_current_viewer(client, session):
+def test_boss_native_history_warns_recruiter_with_latest_activity(client, session):
     headers = login(client, "jiali@example.com")
     for recruiter in session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all():
         recruiter.feishu_open_id = f"open-{recruiter.id}"
@@ -453,13 +466,75 @@ def test_boss_native_history_warns_only_the_current_viewer(client, session):
     assert response.json()["result_type"] == "CONFIRMED_DUPLICATE"
     assert response.json()["lookup_notifications_queued"] == 1
     assert session.scalar(select(DuplicateLookupAlert)).evidence_rank == 3
-    viewer = session.scalar(select(Recruiter).where(Recruiter.display_name == "珈莉"))
+    latest = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
     queued = session.scalars(select(NotificationOutbox)).all()
-    assert [row.recipient_recruiter_id for row in queued] == [viewer.id]
+    assert [row.recipient_recruiter_id for row in queued] == [latest.id]
     repeat = client.post("/api/v1/plugin/context/check", headers=headers, json={**payload, "client_event_id": str(uuid.uuid4())})
     assert repeat.status_code == 200
     assert repeat.json()["lookup_notifications_queued"] == 0
     assert session.scalar(select(func.count()).select_from(NotificationOutbox)) == 1
+
+
+def test_native_history_treats_boss_nickname_and_bound_feishu_name_as_self(session):
+    service = RecruitmentCollaborationService(session)
+    matches = service._merge_native_matches(
+        [{"recruiter_name": "李启明", "job_name": "ai应用开发工程师", "contacted_at": "2026-09-15T13:04:00+08:00"}],
+        {"李先生", "李启明"},
+        {"ai应用开发工程师"},
+        [],
+        True,
+    )
+    assert matches == []
+
+
+def test_duplicate_lookup_notifies_only_recruiter_with_latest_activity(session):
+    viewer = session.scalar(select(Recruiter).where(Recruiter.display_name == "珈莉"))
+    colleague = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
+    viewer.feishu_open_id = "open-viewer"
+    colleague.feishu_open_id = "open-colleague"
+    session.commit()
+    payload = context("最新沟通候选人", "珈莉", "latest-owner")
+    payload["conversation_updated_at"] = "2026-09-15T13:04:00+08:00"
+    match = {
+        "match_level": "EXACT_IDENTITY",
+        "candidate_source_id": "previous-row",
+        "recruiter_id": colleague.id,
+        "recruiter_name": colleague.display_name,
+        "job_id": None,
+        "job_name": "另一个岗位",
+        "stage": "沟通中",
+        "last_activity_at": "2026-09-15T12:00:00+08:00",
+        "match_reason": "姓名、年龄、工作年限、学历一致；招聘者和岗位不同",
+    }
+    assert RecruitmentCollaborationService(session)._queue_lookup_alerts(viewer.company_id, viewer, payload, [match]) == 1
+    session.commit()
+    recipients = set(session.scalars(select(NotificationOutbox.recipient_recruiter_id)).all())
+    assert recipients == {viewer.id}
+
+
+def test_duplicate_lookup_targets_previous_recruiter_when_their_activity_is_newer(session):
+    viewer = session.scalar(select(Recruiter).where(Recruiter.display_name == "珈莉"))
+    colleague = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
+    viewer.feishu_open_id = "open-viewer"
+    colleague.feishu_open_id = "open-colleague"
+    session.commit()
+    payload = context("此前招聘者更新候选人", "珈莉", "previous-latest")
+    payload["conversation_updated_at"] = "2026-09-15T12:00:00+08:00"
+    match = {
+        "match_level": "EXACT_IDENTITY",
+        "candidate_source_id": "newer-previous-row",
+        "recruiter_id": colleague.id,
+        "recruiter_name": colleague.display_name,
+        "job_id": None,
+        "job_name": "另一个岗位",
+        "stage": "沟通中",
+        "last_activity_at": "2026-09-15T13:04:00+08:00",
+        "match_reason": "姓名、年龄、工作年限、学历一致；招聘者和岗位不同",
+    }
+    assert RecruitmentCollaborationService(session)._queue_lookup_alerts(viewer.company_id, viewer, payload, [match]) == 1
+    session.commit()
+    recipients = set(session.scalars(select(NotificationOutbox.recipient_recruiter_id)).all())
+    assert recipients == {colleague.id}
 
 
 def test_a_real_message_still_notifies_both_recruiters_about_the_conflict(client, session):
@@ -564,97 +639,44 @@ def test_resume_preview_accepts_supported_formats(client, session, file_name, co
     assert session.get(CandidateSource, source_id).resume_status == "READY"
 
 
-def test_scan_checkpoint_defaults_to_current_anchor_and_never_moves_backwards(client):
-    initial = client.get("/api/v1/plugin/conversations/checkpoint", params={"account_display_name": "谢女士"})
-    assert initial.status_code == 200 and initial.json()["initial"] is True
-    assert initial.json()["completed_through_at"]
-    partial = {"platform": "boss", "account_display_name": "谢女士", "completed_through_at": "2026-09-02T03:00:00Z", "cursor": {"candidate": "甲"}}
-    rejected = client.put("/api/v1/plugin/conversations/checkpoint", json=partial)
-    assert rejected.status_code == 200 and rejected.json()["accepted"] is False
-    assert client.get("/api/v1/plugin/conversations/checkpoint", params={"account_display_name": "谢女士"}).json()["initial"] is True
-    later = {**partial, "completed_through_at": "2026-09-02T02:00:00Z", "cursor": {"scanned": 3, "complete": True}}
-    accepted = client.put("/api/v1/plugin/conversations/checkpoint", json=later)
-    assert accepted.status_code == 200 and accepted.json()["accepted"] is True
-    earlier = {**later, "completed_through_at": "2026-09-01T02:00:00Z", "cursor": {"scanned": 2, "complete": True}}
-    response = client.put("/api/v1/plugin/conversations/checkpoint", json=earlier)
-    assert response.status_code == 200
-    assert response.json()["completed_through_at"].startswith("2026-09-02T02:00:00")
+def test_scan_report_records_monitoring_time_without_anchoring_candidates(client, session):
+    """Polling is anchor-free; the report is monitoring data, never a filter."""
+    from recruitment_collab.infrastructure.models import ConversationScanCheckpoint
 
-
-def test_scan_restart_sets_a_real_historical_anchor_until_a_full_pass_completes(client):
-    first = client.put(
-        "/api/v1/plugin/conversations/checkpoint",
+    headers = login(client, "xie@example.com")
+    response = client.post(
+        "/api/v1/plugin/conversations/scan-report",
+        headers=headers,
         json={
             "platform": "boss",
             "account_display_name": "谢女士",
-            "completed_through_at": "2026-09-08T02:00:00Z",
-            "cursor": {"scanned": 4, "complete": True},
+            "completed_through_at": datetime.now(timezone.utc).isoformat(),
+            "cursor": {"traversed": 12, "candidates_opened": 3, "unread_left_alone": 9},
         },
     )
-    assert first.status_code == 200
-
-    restarted = client.post(
-        "/api/v1/plugin/conversations/restart",
-        params={"account_display_name": "谢女士", "platform": "boss"},
+    assert response.status_code == 200, response.text
+    assert response.json()["accepted"] is True
+    row = session.scalar(
+        select(ConversationScanCheckpoint).where(ConversationScanCheckpoint.account_display_name == "谢女士")
     )
-    assert restarted.status_code == 200
-    assert restarted.json() == {
-        "accepted": True,
-        "completed_through_at": "1970-01-01T00:00:00+00:00",
-        "historical_rescan": True,
-    }
+    assert row is not None
+    assert row.cursor_json["unread_left_alone"] == 9
 
-    checkpoint = client.get(
-        "/api/v1/plugin/conversations/checkpoint",
-        params={"account_display_name": "谢女士", "platform": "boss"},
-    )
-    assert checkpoint.status_code == 200
-    assert checkpoint.json()["historical_rescan"] is True
-    scan_id = checkpoint.json()["cursor"]["scan_id"]
-    assert isinstance(scan_id, str) and scan_id
-    assert checkpoint.json()["cursor"]["mode"] == "HISTORICAL_RESCAN"
-    assert checkpoint.json()["cursor"]["complete"] is False
-    assert checkpoint.json()["completed_through_at"] == "1970-01-01T00:00:00+00:00"
 
-    partial = client.put(
-        "/api/v1/plugin/conversations/checkpoint",
+def test_scan_report_rejects_a_future_pass_time(client):
+    headers = login(client, "xie@example.com")
+    response = client.post(
+        "/api/v1/plugin/conversations/scan-report",
+        headers=headers,
         json={
             "platform": "boss",
             "account_display_name": "谢女士",
-            "completed_through_at": "2026-09-10T02:00:00Z",
-            "cursor": {"scanned": 2},
+            "completed_through_at": "2099-01-01T00:00:00Z",
+            "cursor": {},
         },
     )
-    assert partial.status_code == 200
-    assert partial.json()["accepted"] is False
-    assert partial.json()["completed_through_at"] == "1970-01-01T00:00:00+00:00"
-
-    stale_complete = client.put(
-        "/api/v1/plugin/conversations/checkpoint",
-        json={
-            "platform": "boss",
-            "account_display_name": "谢女士",
-            "completed_through_at": "2026-09-10T02:30:00Z",
-            "cursor": {"scanned": 99, "complete": True, "scan_id": "old-scan"},
-        },
-    )
-    assert stale_complete.status_code == 200
-    assert stale_complete.json()["accepted"] is False
-    assert stale_complete.json()["completed_through_at"] == "1970-01-01T00:00:00+00:00"
-
-    completed = client.put(
-        "/api/v1/plugin/conversations/checkpoint",
-        json={
-            "platform": "boss",
-            "account_display_name": "谢女士",
-            "completed_through_at": "2026-09-10T03:00:00Z",
-            "cursor": {"scanned": 12, "complete": True, "scan_id": scan_id},
-        },
-    )
-    assert completed.status_code == 200
-    assert completed.json()["accepted"] is True
-    assert completed.json()["completed_through_at"].startswith("2026-09-10T03:00:00")
-    assert completed.json()["cursor"] == {"scanned": 12, "complete": True, "scan_id": scan_id}
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "CHECKPOINT_TIME_INVALID"
 
 
 def test_unmapped_recruitment_account_does_not_block_candidate_flow(client):
@@ -897,8 +919,8 @@ def test_idempotent_retry_requests_snapshot_when_previous_capture_failed(client,
     headers = login(client, "xie@example.com")
     payload = {
         **context("截图重试候选人", "谢女士", "snapshot-retry"),
-        "recruitment_status": "已约面",
-        "status_evidence": "BOSS_INTERVIEW_MARKER",
+        "recruitment_status": "沟通中",
+        "status_evidence": "RECRUITER_OUTBOUND",
         "status_rule_version": "boss-status-v4",
     }
     first = message_sent(client, headers, payload)
@@ -915,7 +937,7 @@ def test_idempotent_retry_requests_snapshot_when_previous_capture_failed(client,
     assert repeat.json()["snapshot_needed"] is True
 
 
-def test_snapshot_is_requested_only_for_a_confirmed_interview_invitation(client, session):
+def test_snapshot_is_requested_only_by_the_history_sync(client, session):
     headers = login(client, "xie@example.com")
     opened = {
         **context("邀约截图候选人", "谢女士", "invite-snapshot"),
@@ -925,9 +947,12 @@ def test_snapshot_is_requested_only_for_a_confirmed_interview_invitation(client,
     }
     first = client.post("/api/v1/plugin/conversations/sync", json=opened)
     assert first.status_code == 200
-    # Opening (or re-observing) a conversation must never ask for the
-    # historical chat capture: it scrolls the recruiter's own chat pane.
+    # Only the history sweep captures: a click, a reconcile pass or a plain
+    # re-open never photographs the recruiter's own pane.
     assert first.json()["snapshot_needed"] is False
+    source = session.get(CandidateSource, first.json()["candidate_source_id"])
+    source.snapshot_status, source.snapshot_tokens_json = "READY", ["snapshot-token"]
+    session.commit()
     newer = client.post(
         "/api/v1/plugin/conversations/sync",
         json={
@@ -940,6 +965,19 @@ def test_snapshot_is_requested_only_for_a_confirmed_interview_invitation(client,
     assert newer.status_code == 200
     assert newer.json()["snapshot_needed"] is False
 
+    history = client.post(
+        "/api/v1/plugin/conversations/sync",
+        json={
+            **opened,
+            "client_event_id": str(uuid.uuid4()),
+            "sent_at": "2026-09-02T03:00:00Z",
+            "conversation_updated_at": "2026-09-02T03:00:00Z",
+            "sync_reason": "HISTORY_SNAPSHOT",
+        },
+    )
+    assert history.status_code == 200
+    assert history.json()["snapshot_needed"] is True
+
     chat = message_sent(
         client,
         headers,
@@ -950,6 +988,8 @@ def test_snapshot_is_requested_only_for_a_confirmed_interview_invitation(client,
         },
     )
     assert chat.status_code == 200
+    # An ordinary message only registers the event: the full chat capture
+    # scrolls the pane the recruiter is still typing in.
     assert chat.json()["snapshot_needed"] is False
 
     invite = message_sent(
@@ -960,11 +1000,25 @@ def test_snapshot_is_requested_only_for_a_confirmed_interview_invitation(client,
             "recruitment_status": "已约面",
             "status_evidence": "BOSS_INTERVIEW_MARKER",
             "status_rule_version": "boss-status-v4",
+            "interview": {
+                "interview_type": "ONLINE",
+                "scheduled_at": "2026-09-05T06:00:00Z",
+                "location": "线上视频面试",
+            },
         },
     )
     assert invite.status_code == 200
-    assert invite.json()["snapshot_needed"] is True
+    # No send asks for a screenshot, the interview invitation included: the
+    # confirmation still records the interview row and the 已约面 status, while
+    # the chat long image stays the history pass's job.
+    assert invite.json()["snapshot_needed"] is False
     assert session.get(CandidateSource, invite.json()["candidate_source_id"]).recruitment_status == "已约面"
+    assert session.scalar(
+        select(func.count()).select_from(Interview).where(Interview.candidate_source_id == invite.json()["candidate_source_id"])
+    ) == 1
+    assert session.scalar(
+        select(func.count()).select_from(Interview).where(Interview.candidate_source_id == invite.json()["candidate_source_id"])
+    ) == 1
 
 
 def test_boss_non_chat_page_is_ignored(client, session):
@@ -1040,3 +1094,356 @@ def test_continue_requires_reason(client):
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "REASON_REQUIRED"
+
+
+def _reconcile(client, headers, name, job, activity, date_only=False):
+    return client.post(
+        "/api/v1/plugin/conversations/reconcile",
+        headers=headers,
+        json={
+            "platform": "mock",
+            "account_display_name": "谢女士",
+            "candidate_display_name": name,
+            "job_display_name": job,
+            "list_activity_at": activity,
+            "list_activity_date_only": date_only,
+        },
+    )
+
+
+def test_same_candidate_merges_when_one_profile_card_is_incomplete(client, session):
+    """One candidate + one BOSS account + one job is exactly one row.
+
+    BOSS hydrates the profile card in stages, so a second observation of the
+    same person can carry a different (or missing) age/education and therefore
+    a different identity signature. It must reuse the existing row.
+    """
+    headers = login(client, "xie@example.com")
+    first = client.post(
+        "/api/v1/plugin/conversations/sync",
+        json={
+            **context("补全资料候选人", "谢女士", "merge-one"),
+            "sent_at": "2025-09-02T01:00:00Z",
+            "conversation_updated_at": "2025-09-02T01:00:00Z",
+            "has_recruiter_outbound": False,
+            "sync_reason": "UNREAD_CANDIDATE_OPENED",
+        },
+    ).json()
+    second = client.post(
+        "/api/v1/plugin/conversations/sync",
+        json={
+            **context("补全资料候选人", "谢女士", "merge-two"),
+            "candidate_age": None,
+            "candidate_experience": None,
+            "candidate_education": None,
+            "sent_at": "2025-09-02T02:00:00Z",
+            "conversation_updated_at": "2025-09-02T02:00:00Z",
+            "has_recruiter_outbound": False,
+            "sync_reason": "UNREAD_CANDIDATE_OPENED",
+        },
+    ).json()
+    assert second["candidate_source_id"] == first["candidate_source_id"]
+    assert session.scalar(select(func.count()).select_from(CandidateSource)) == 1
+    source = session.get(CandidateSource, first["candidate_source_id"])
+    assert source.candidate_age == 28
+    assert source.candidate_education == "本科"
+
+
+def test_same_age_with_a_shifted_degree_line_is_still_one_candidate(client, session):
+    """Education/experience drift between scans must not split one person."""
+    headers = login(client, "xie@example.com")
+    base = {
+        **context("学历抖动候选人", "谢女士", "drift"),
+        "sent_at": "2025-09-02T01:00:00Z",
+        "conversation_updated_at": "2025-09-02T01:00:00Z",
+        "has_recruiter_outbound": False,
+        "sync_reason": "UNREAD_CANDIDATE_OPENED",
+    }
+    first = client.post("/api/v1/plugin/conversations/sync", json=base).json()
+    second = client.post(
+        "/api/v1/plugin/conversations/sync",
+        json={
+            **base,
+            "client_event_id": str(uuid.uuid4()),
+            "candidate_experience": "26年",
+            "candidate_education": "大专",
+            "conversation_updated_at": "2025-09-02T03:00:00Z",
+        },
+    ).json()
+    assert second["candidate_source_id"] == first["candidate_source_id"]
+    assert session.scalar(select(func.count()).select_from(CandidateSource)) == 1
+
+
+def test_leaked_list_metadata_is_not_part_of_the_job_identity(client, session):
+    """A leaked list row in the job field must not create a second candidate."""
+    headers = login(client, "xie@example.com")
+    clean = client.post(
+        "/api/v1/plugin/conversations/sync",
+        json={
+            **context("岗位噪声候选人", "谢女士", "job-clean"),
+            "sent_at": "2025-09-02T01:00:00Z",
+            "conversation_updated_at": "2025-09-02T01:00:00Z",
+            "has_recruiter_outbound": False,
+            "sync_reason": "UNREAD_CANDIDATE_OPENED",
+        },
+    ).json()
+    noisy = client.post(
+        "/api/v1/plugin/conversations/sync",
+        json={
+            **context("岗位噪声候选人", "谢女士", "job-noisy"),
+            "job_display_name": "短视频编导 最近关注: 无锡 · 主播 6-11K 17:58 9月11日 沟通的职位-短视频编导 送达 你好",
+            "sent_at": "2025-09-02T02:00:00Z",
+            "conversation_updated_at": "2025-09-02T02:00:00Z",
+            "has_recruiter_outbound": False,
+            "sync_reason": "UNREAD_CANDIDATE_OPENED",
+        },
+    ).json()
+    assert noisy["candidate_source_id"] == clean["candidate_source_id"]
+    assert session.scalar(select(func.count()).select_from(CandidateSource)) == 1
+
+
+def test_reconcile_prices_each_list_row_against_the_table(client, session):
+    """The reader's rule: absent -> create, newer -> update, same -> skip."""
+    headers = login(client, "xie@example.com")
+    created = client.post(
+        "/api/v1/plugin/conversations/sync",
+        json={
+            **context("对账候选人", "谢女士", "reconcile"),
+            "sent_at": "2025-09-02T02:00:00Z",
+            "conversation_updated_at": "2025-09-02T02:00:00Z",
+            "has_recruiter_outbound": False,
+            "sync_reason": "UNREAD_CANDIDATE_OPENED",
+        },
+    ).json()
+    source_id = created["candidate_source_id"]
+
+    missing = _reconcile(client, headers, "没见过的候选人", "短视频编导", "2025-09-02T02:00:00Z")
+    assert missing.status_code == 200, missing.text
+    assert missing.json()["decision"] == "SYNC"
+    assert missing.json()["reason"] == "CANDIDATE_NOT_IN_TABLE"
+
+    stored = session.get(CandidateSource, source_id)
+    stored.feishu_record_id = None
+    session.commit()
+    unsent = _reconcile(client, headers, "对账候选人", "短视频编导", "2025-09-02T02:00:00Z")
+    assert unsent.json()["decision"] == "SYNC"
+    assert unsent.json()["reason"] == "FEISHU_ROW_MISSING"
+
+    stored.feishu_record_id = "rec-existing"
+    session.commit()
+    same = _reconcile(client, headers, "对账候选人", "短视频编导", "2025-09-02T02:00:00Z")
+    assert same.json()["decision"] == "SKIP"
+    assert same.json()["reason"] == "LIST_ACTIVITY_UNCHANGED"
+
+    older = _reconcile(client, headers, "对账候选人", "短视频编导", "2025-09-02T01:00:00Z")
+    assert older.json()["decision"] == "SKIP"
+
+    newer = _reconcile(client, headers, "对账候选人", "短视频编导", "2025-09-02T03:00:00Z")
+    assert newer.json()["decision"] == "SYNC"
+    assert newer.json()["reason"] == "LIST_ACTIVITY_NEWER"
+
+
+def test_reconcile_compares_calendar_only_rows_by_day(client, session):
+    """`09月02日` carries no clock, so it must never be read as midnight."""
+    headers = login(client, "xie@example.com")
+    created = client.post(
+        "/api/v1/plugin/conversations/sync",
+        json={
+            **context("日历候选人", "谢女士", "date-only"),
+            "sent_at": "2025-09-02T18:30:00Z",
+            "conversation_updated_at": "2025-09-02T18:30:00Z",
+            "has_recruiter_outbound": False,
+            "sync_reason": "UNREAD_CANDIDATE_OPENED",
+        },
+    ).json()
+    stored = session.get(CandidateSource, created["candidate_source_id"])
+    stored.feishu_record_id = "rec-calendar"
+    session.commit()
+
+    same_day = _reconcile(client, headers, "日历候选人", "短视频编导", "2025-09-02T00:00:00Z", date_only=True)
+    assert same_day.json()["decision"] == "SKIP"
+    later_day = _reconcile(client, headers, "日历候选人", "短视频编导", "2025-09-03T00:00:00Z", date_only=True)
+    assert later_day.json()["decision"] == "SYNC"
+    assert later_day.json()["reason"] == "LIST_ACTIVITY_NEWER"
+
+
+def test_message_bubble_time_is_not_rolled_back_by_a_later_scan(client, session):
+    """更新时间 follows the sent bubble, not the list row."""
+    headers = login(client, "xie@example.com")
+    source_id = message_sent(
+        client, headers, context("气泡时间候选人", "谢女士", "bubble"),
+        sent_at="2025-09-02T05:30:00Z",
+    ).json()["candidate_source_id"]
+    session.expire_all()
+    source = session.get(CandidateSource, source_id)
+    assert source.conversation_updated_at.isoformat().startswith("2025-09-02T05:30:00")
+
+    client.post(
+        "/api/v1/plugin/conversations/sync",
+        json={
+            **context("气泡时间候选人", "谢女士", "bubble-again"),
+            "sent_at": "2025-09-02T09:10:00Z",
+            "conversation_updated_at": "2025-09-02T09:10:00Z",
+            "has_recruiter_outbound": True,
+            "sync_reason": "UNREAD_CANDIDATE_OPENED",
+        },
+    )
+    session.expire_all()
+    source = session.get(CandidateSource, source_id)
+    assert source.conversation_updated_at.isoformat().startswith("2025-09-02T09:10:00")
+
+
+def test_browse_alert_warns_latest_recruiter_and_reconciliation_is_silent(client, session):
+    """Where the “候选人浏览查重提醒” comes from, and who it reaches."""
+    xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
+    for recruiter in session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all():
+        recruiter.feishu_open_id = f"open-{recruiter.id}"
+    session.commit()
+    xie_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
+    jiali_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "珈莉"))
+    assert message_sent(client, xie, context("浏览提醒候选人", "谢女士", "browse-first")).status_code == 200
+
+    payload = context("浏览提醒候选人", "珈莉", "browse-second")
+    opened = client.post("/api/v1/plugin/context/check", headers=jiali, json=payload)
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["result_type"] == "CONFIRMED_DUPLICATE"
+    assert opened.json()["lookup_notifications_queued"] == 1
+    alert = session.scalar(select(DuplicateLookupAlert))
+    assert alert is not None and alert.matched_recruiter_id == xie_recruiter.id
+    recipients = set(session.scalars(select(NotificationOutbox.recipient_recruiter_id)).all())
+    assert recipients == {xie_recruiter.id}
+    assert jiali_recruiter.id not in recipients
+
+    reconciled = client.post(
+        "/api/v1/plugin/conversations/sync",
+        headers=jiali,
+        json={
+            **payload,
+            "client_event_id": str(uuid.uuid4()),
+            "sent_at": "2025-09-02T03:00:00Z",
+            "conversation_updated_at": "2025-09-02T03:00:00Z",
+            "has_recruiter_outbound": False,
+            "sync_reason": "CATCHUP_RECONCILED",
+        },
+    )
+    assert reconciled.status_code == 200, reconciled.text
+    assert session.scalar(select(func.count()).select_from(NotificationOutbox)) == 1
+
+
+def test_several_matching_colleagues_are_merged_into_one_card(session):
+    """The same person held by two colleagues is still one message."""
+    viewer = session.scalar(select(Recruiter).where(Recruiter.display_name == "珈莉"))
+    viewer.feishu_open_id = "open-viewer"
+    colleague_a = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
+    colleague_a.feishu_open_id = "open-a"
+    colleague_b = Recruiter(
+        company_id=viewer.company_id,
+        display_name="王女士",
+        email="wang-second@example.com",
+        role="RECRUITER",
+        password_hash=colleague_a.password_hash,
+        feishu_open_id="open-b",
+    )
+    session.add(colleague_b)
+    session.commit()
+
+    base_match = {
+        "match_level": "EXACT_IDENTITY",
+        "candidate_source_id": "rec-row",
+        "recruiter_id": None,
+        "job_id": None,
+        "job_name": "短视频编导",
+        "stage": "沟通中",
+        "match_reason": "姓名、年龄、工作年限、学历完全一致",
+    }
+    queued = RecruitmentCollaborationService(session)._queue_lookup_alerts(
+        viewer.company_id,
+        viewer,
+        context("多人命中候选人", "珈莉", "multi-merged"),
+        [
+            {
+                **base_match,
+                "recruiter_name": "谢女士",
+                "first_contact_at": datetime(2026, 8, 25, 18, 29, tzinfo=timezone.utc).timestamp() * 1000,
+            },
+            {
+                **base_match,
+                "recruiter_name": "王女士",
+                "first_contact_at": datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc).timestamp() * 1000,
+            },
+        ],
+    )
+    session.commit()
+
+    # Two colleagues: two alert rows (cooldown + audit each), one card.
+    assert session.scalar(select(func.count()).select_from(DuplicateLookupAlert)) == 2
+    assert queued == 1
+    cards = session.scalars(select(NotificationOutbox)).all()
+    assert len(cards) == 1
+    payload = cards[0].payload_json
+    assert payload["matched_colleague_count"] == 2
+    # The recipient is the recruiter with the newest real contact (王女士); the
+    # card describes the *other* side and therefore never names its recipient.
+    recipient = session.get(Recruiter, cards[0].recipient_recruiter_id)
+    assert recipient.display_name == "王女士"
+    names = {item["recruiter_name"] for item in payload["matched_recruiter_details"]}
+    assert names == {"珈莉", "谢女士"}
+    assert recipient.display_name not in names
+    for alert in session.scalars(select(DuplicateLookupAlert)).all():
+        assert alert.last_notified_at is not None
+
+
+def test_second_recruiter_who_really_comms_receives_the_lookup_card(client, session):
+    """A confirmed send is real communication and decides who is reminded.
+
+    The first recruiter contacts the candidate alone and hears nothing. When a
+    second recruiter actually writes to the same candidate, that newer real
+    conversation — not the first recruiter's stored row time — decides who gets
+    the card.
+    """
+    xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
+    for recruiter in session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all():
+        recruiter.feishu_open_id = f"open-{recruiter.id}"
+    session.commit()
+    xie_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
+    jiali_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "珈莉"))
+
+    first = message_sent(client, xie, context("先后沟通候选人", "谢女士", "two-first"), sent_at="2026-09-15T10:00:00+08:00")
+    assert first.status_code == 200, first.text
+    # Nobody else held the candidate yet, so the first communication is silent.
+    assert session.scalar(select(func.count()).select_from(NotificationOutbox).where(NotificationOutbox.event_type == "DUPLICATE_LOOKUP")) == 0
+
+    second = message_sent(client, jiali, context("先后沟通候选人", "珈莉", "two-second"), sent_at="2026-09-15T11:00:00+08:00")
+    assert second.status_code == 200, second.text
+    assert second.json()["lookup_notifications_queued"] == 1
+
+    cards = session.scalars(select(NotificationOutbox).where(NotificationOutbox.event_type == "DUPLICATE_LOOKUP")).all()
+    assert [card.recipient_recruiter_id for card in cards] == [jiali_recruiter.id]
+    assert xie_recruiter.id not in {card.recipient_recruiter_id for card in cards}
+    payload = cards[0].payload_json
+    assert payload["trigger"] == "SEND"
+    assert payload["recipient_is_viewer"] is True
+    # The card tells the second communicator about the colleague who already has
+    # the candidate, never about themselves.
+    assert payload["matched_recruiter_name"] == "谢女士"
+    assert payload["matched_recruiter_names"] == ["谢女士"]
+
+
+def test_lookup_card_never_names_its_own_recipient(client, session):
+    """A browse by a second recruiter warns the newest real communicator."""
+    xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
+    for recruiter in session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all():
+        recruiter.feishu_open_id = f"open-{recruiter.id}"
+    session.commit()
+    xie_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
+    assert message_sent(client, xie, context("只浏览候选人", "谢女士", "browse-first"), sent_at="2026-09-15T10:00:00+08:00").status_code == 200
+
+    opened = client.post("/api/v1/plugin/context/check", headers=jiali, json=context("只浏览候选人", "珈莉", "browse-second"))
+    assert opened.status_code == 200, opened.text
+    cards = session.scalars(select(NotificationOutbox).where(NotificationOutbox.event_type == "DUPLICATE_LOOKUP")).all()
+    assert [card.recipient_recruiter_id for card in cards] == [xie_recruiter.id]
+    payload = cards[0].payload_json
+    assert payload["trigger"] == "BROWSE"
+    assert payload["recipient_is_viewer"] is False
+    assert payload["matched_recruiter_name"] == "珈莉"
+    assert "谢女士" not in payload["matched_recruiter_names"]

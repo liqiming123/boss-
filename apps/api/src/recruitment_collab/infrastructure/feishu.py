@@ -382,17 +382,54 @@ class FeishuOAuthClient:
 class FeishuCardBuilder:
     def duplicate_card(self, payload: dict[str, Any]) -> dict[str, Any]:
         browsing = payload.get("type") == "DUPLICATE_LOOKUP"
-        title = "候选人浏览查重提醒" if browsing else "候选人跟进冲突提醒"
-        # The browsing card goes to the viewer only, so it is written in the
-        # second person; a "current viewer" line would just echo the
-        # recipient's own name back at them.
+        # A lookup card triggered by a confirmed outbound message is not a
+        # browse: the recipient is the recruiter who just wrote to the
+        # candidate, so say what actually happened.
+        title = (
+            "候选人重复沟通提醒"
+            if browsing and payload.get("trigger") == "SEND"
+            else "候选人浏览查重提醒"
+            if browsing
+            else "候选人跟进冲突提醒"
+        )
+        # The card always names the *other* recruiters, never its recipient.
         context = f"**岗位**：{payload.get('job_name', '未知')}\n" if browsing else ""
+        details = payload.get("matched_recruiter_details")
+        if isinstance(details, list) and len(details) > 1:
+            # One candidate, several other recruiters: a single card that lists
+            # them all, instead of one near-identical card each.
+            lines = [
+                f"**其他招聘者**：{payload.get('matched_recruiter_name', '未知')}（共 {len(details)} 人）"
+            ]
+            for item in details:
+                lines.append(
+                    f"- {item.get('recruiter_name', '未知')}｜{item.get('job_name') or '岗位未知'}"
+                    f"｜首次沟通 {item.get('first_contact_at') or '未知'}"
+                    f"｜最近活动 {item.get('last_activity_at') or '未知'}"
+                    f"｜{item.get('match_reason') or '历史记录'}"
+                )
+            matched_lines = "\n".join(lines)
+        else:
+            matched_lines = (
+                f"**其他招聘者**：{payload.get('matched_recruiter_name', '未知')}\n"
+                f"**首次沟通**：{payload.get('first_contact_at') or '未知'}\n"
+                f"**最近活动**：{payload.get('last_activity_at') or '未知'}\n"
+                f"**匹配依据**：{payload.get('match_reason', '未知')}"
+            )
         elements: list[dict[str, Any]] = [
             {
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": f"**候选人**：{payload.get('candidate_name', '未知')}\n{context}**已有招聘者**：{payload.get('matched_recruiter_name', '未知')}\n**首次沟通**：{payload.get('first_contact_at') or '未知'}\n**最近活动**：{payload.get('last_activity_at') or '未知'}\n**匹配依据**：{payload.get('match_reason', '未知')}\n{payload.get('current_action', '')}\n{'当前仅浏览，尚未确认已发送消息。' if browsing else '请人工核对，不会自动合并。'}",
+                    "content": (
+                        f"**候选人**：{payload.get('candidate_name', '未知')}\n{context}{matched_lines}\n"
+                        + (
+                            f"**当前招聘者状态**：{payload.get('current_recruiter_status', '待建立跟进记录')}\n"
+                            f"**候选人当前状态**：{payload.get('candidate_status', '沟通中')}"
+                            if browsing
+                            else "请人工核对，不会自动合并。"
+                        )
+                    ),
                 },
             }
         ]

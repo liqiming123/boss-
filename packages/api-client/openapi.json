@@ -3993,7 +3993,7 @@
           },
           "sync_reason": {
             "type": "string",
-            "pattern": "^(MESSAGE_SENT|CATCHUP|CONVERSATION_UPDATED|CANDIDATE_OPENED)$",
+            "pattern": "^(MESSAGE_SENT|CATCHUP|CONVERSATION_UPDATED|CANDIDATE_OPENED|UNREAD_CANDIDATE_OPENED|CATCHUP_RECONCILED|HISTORY_SNAPSHOT)$",
             "title": "Sync Reason",
             "default": "CATCHUP"
           }

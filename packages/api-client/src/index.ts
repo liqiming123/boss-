@@ -40,7 +40,7 @@ export class ApiClient {
   constructor(
     private baseUrl: string,
     private getToken: () => string | null,
-    private refreshToken?: () => Promise<string | null>,
+    private refreshToken?: (signal?: AbortSignal) => Promise<string | null>,
     private onAuthenticationFailed?: () => void,
   ) {}
 
@@ -70,7 +70,10 @@ export class ApiClient {
       this.refreshToken &&
       !path.startsWith("/auth/")
     ) {
-      this.refreshInFlight ??= this.refreshToken().finally(() => {
+      // Reuse the caller's deadline for token refresh. Without this, a
+      // stalled refresh request can outlive the original request timeout and
+      // leave extension UI waiting indefinitely after an expired access token.
+      this.refreshInFlight ??= this.refreshToken(init.signal ?? undefined).finally(() => {
         this.refreshInFlight = null;
       });
       const refreshedToken = await this.refreshInFlight;

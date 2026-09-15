@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     # when a deployment explicitly needs to narrow that scope.
     admin_roles: List[str] = Field(default_factory=list)
     public_web_url: str = "http://localhost:5173"
+    # A cross-BOSS-account duplicate is time-sensitive: a colleague may be
+    # about to contact the same person. The same viewer/candidate/job hit is
+    # therefore re-notified after this many minutes instead of the old fixed
+    # 24-hour window. Set 0 to notify on every detection.
+    lookup_alert_cooldown_minutes: int = 30
     candidate_cache_days: int = 30
     diagnostic_retention_days: int = 30
     event_retention_days: int = 90

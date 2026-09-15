@@ -7,6 +7,67 @@ import { findBossConversationRegion } from "./boss-chat";
 type SnapshotResult = { parts: string[]; hash: string };
 type CaptureTarget = { getBoundingClientRect: () => DOMRect };
 
+/**
+ * A canvas that will be read back must ask for the CPU-backed context when it
+ * is created: Chrome otherwise keeps it GPU-backed, copies the whole surface on
+ * every `getImageData` call and logs the "willReadFrequently" warning. The
+ * captured conversation tile is read row by row for its signature, so it is
+ * created that way; canvases that are only drawn into and exported stay
+ * GPU-backed, where `drawImage`/`toDataURL` are faster.
+ */
+function context2d(canvas: HTMLCanvasElement, readFrequently = false) {
+  return canvas.getContext(
+    "2d",
+    readFrequently ? { willReadFrequently: true } : undefined,
+  );
+}
+
+/** Vertical luminance signature of a captured tile, used only to prove that a
+ * new viewport really shows different content. */
+export function columnSignature(canvas: HTMLCanvasElement): number[] | undefined {
+  // The tile canvas comes from `captureCrop`, which already requested the
+  // readback-friendly context; `getContext` returns that same context here.
+  const context = context2d(canvas, true);
+  if (!context || !canvas.height || !canvas.width) return undefined;
+  const stride = Math.max(1, Math.floor(canvas.height / 64));
+  const rows: number[] = [];
+  try {
+    for (let y = 0; y < canvas.height; y += stride) {
+      const data = context.getImageData(0, y, canvas.width, 1).data;
+      let total = 0;
+      for (let index = 0; index < data.length; index += 4)
+        total += data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+      rows.push(total / (data.length / 4));
+    }
+  } catch {
+    // Tainted or detached canvas: fall back to no verification rather than
+    // failing the snapshot.
+    return undefined;
+  }
+  return rows.length >= 2 ? rows : undefined;
+}
+
+/** How confidently the previously captured viewport reappears exactly
+ * `shift` pixels lower in the new tile. 1 means every sampled row matches. */
+export function shiftConfidence(
+  previous: number[] | undefined,
+  current: number[] | undefined,
+  shift: number,
+  stride: number,
+): number | undefined {
+  if (!previous || !current) return undefined;
+  const offset = Math.round(shift / stride);
+  if (offset <= 0 || offset >= previous.length) return undefined;
+  let compared = 0;
+  let matched = 0;
+  for (let index = 0; index + offset < current.length; index++) {
+    compared++;
+    if (Math.abs(previous[index] - current[index + offset]) <= 3) matched++;
+  }
+  if (!compared) return undefined;
+  return matched / compared;
+}
+
 export class SnapshotCaptureError extends Error {
   constructor(public code: string) {
     super(code);
@@ -102,8 +163,9 @@ async function captureCrop(element: CaptureTarget, fallback = false): Promise<HT
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.floor(rect.width * scale));
   canvas.height = Math.max(1, Math.floor(rect.height * scale));
-  canvas
-    .getContext("2d")
+  // This tile is read back row by row for its signature, so declare the
+  // readback-friendly (CPU-backed) context before the first draw.
+  context2d(canvas, true)
     ?.drawImage(
       image,
       Math.max(0, rect.left * scale),
@@ -184,21 +246,55 @@ export async function captureBossConversationSnapshot(): Promise<SnapshotResult>
     }
     if (interrupted)
       throw new SnapshotCaptureError("SNAPSHOT_INTERRUPTED_BY_USER");
-    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight),
-      step = Math.max(1, scroller.clientHeight - 32),
-      crops: HTMLCanvasElement[] = [];
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    // No overlap: neighbouring tiles must be adjacent slices, otherwise the
+    // same messages are stitched twice.
+    const step = Math.max(1, scroller.clientHeight);
+    const crops: HTMLCanvasElement[] = [];
+    let previousSignature: number[] | undefined;
+    let previousAppliedTop = 0;
     for (
       let position = 0;
       position <= max && !interrupted;
       position = Math.min(max, position + step)
     ) {
-      scroller.scrollTop = position;
-      // captureVisibleTab is quota-limited by Chrome (normally two calls per
-      // second). Keep a safe gap between historical chat tiles so long
-      // conversations do not fail midway through with a quota error.
-      await delay(650);
-      crops.push(await captureCrop(scroller));
-      if (position === max) break;
+      let appended = false;
+      for (let attempt = 0; attempt < 3 && !interrupted && !appended; attempt++) {
+        // A stalled scroll (wrong container, or the shell swallowing the
+        // wheel event) leaves the viewport where it was. Retry a little
+        // further down, and never append a tile that repeats the previous one.
+        const target = Math.min(max, position + attempt * Math.floor(step / 2));
+        scroller.scrollTop = target;
+        // captureVisibleTab is quota-limited by Chrome (normally two calls per
+        // second). Keep a safe gap between historical chat tiles so long
+        // conversations do not fail midway through with a quota error.
+        await delay(650);
+        const crop = await captureCrop(scroller);
+        const signature = columnSignature(crop);
+        const appliedTop = scroller.scrollTop;
+        if (crops.length) {
+          const rows = signature?.length ?? 0;
+          const stride = rows > 1
+            ? Math.max(1, Math.floor(crop.height / rows))
+            : Math.max(1, crop.height);
+          const confidence = shiftConfidence(
+            previousSignature,
+            signature,
+            appliedTop - previousAppliedTop,
+            stride,
+          );
+          // Undefined means we cannot compare pixels; trust the scroll instead
+          // of losing the capture.
+          if (confidence !== undefined && confidence < 0.6) continue;
+        }
+        crops.push(crop);
+        previousSignature = signature;
+        previousAppliedTop = appliedTop;
+        appended = true;
+        if (appliedTop >= max - 1) position = max;
+      }
+      if (!appended) break;
+      if (position >= max) break;
     }
     if (interrupted)
       throw new SnapshotCaptureError("SNAPSHOT_INTERRUPTED_BY_USER");

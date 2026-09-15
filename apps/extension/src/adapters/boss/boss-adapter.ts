@@ -18,6 +18,7 @@ import {
   bossHistoricalJobs,
   classifyBossOutgoingMessage,
   classifyBossStatus,
+  resolveBossStatusEvidence,
 } from "./boss-status";
 import { collectBossNativeCommunicationHistory } from "./boss-native-history";
 import { isBossHostname } from "./boss-hosts";
@@ -64,10 +65,19 @@ const BOSS_UI_TEXT =
   /^(?:滚动加载更多|点击加载更多|加载更多|查看更多|展开更多|收起|展开|没有更多了?|暂无更多|暂无数据|没有相关数据|暂无信息|加载中|正在加载|请稍候|未登录|请先登录|立即登录|刷新|换一换|下载APP|使用说明|意见反馈|帮助中心|回到顶部|全部职位|知道了|我知道了|确定|取消)$/;
 const isBossUiText = (value: string) =>
   BOSS_UI_TEXT.test(value) || /加载更多|查看更多|暂无数据|没有更多|暂无更多/.test(value);
+// The age-less profile fallback scans the lines immediately before experience
+// or education. On the real chat page BOSS can interleave the latest message
+// bubble with those profile fields, so a short all-Chinese sentence (for
+// example “有剧本吗”) otherwise looks exactly like a Chinese name. Keep this
+// list semantic and deliberately narrow: it blocks profile labels and obvious
+// conversational clauses while still allowing uncommon short display names.
+const BOSS_NON_NAME_TEXT =
+  /(?:未填写|工作经历|求职意向|个人优势|测试时间|时间限制|联系方式|微信|手机号|简历|招聘|职位|沟通|好的.*感谢|谢谢|感谢|您好|你好|请问)|(?:吗|呢|呀|吧)[？?]?$/;
 const isName = (value: string) =>
   /^[\u4e00-\u9fff·]{2,20}$/.test(value.replace(/[ \t]+(?=[\u4e00-\u9fff·])/g, "")) &&
   !isBossUiText(value.replace(/[ \t]+/g, "")) &&
-  !/(职位|沟通|简历|本科|硕士|大专|活跃|昨天|今天|刚刚|全部|未读)/.test(value.replace(/[ \t]+/g, ""));
+  !BOSS_NON_NAME_TEXT.test(value.replace(/[ \t]+/g, "")) &&
+  !/(本科|硕士|大专|活跃|昨天|今天|刚刚|全部|未读)/.test(value.replace(/[ \t]+/g, ""));
 const canonicalName = (value: string) =>
   value.replace(/[ \t]+(?=[\u4e00-\u9fff·])/g, "");
 // `26届` and `26年毕业` are graduation cohorts, not years of experience. The
@@ -355,15 +365,14 @@ export class BossAdapter implements RecruitmentSiteAdapter {
     const outgoingStatus = outgoingText
       ? classifyBossOutgoingMessage(outgoingText)
       : null;
-    // Prefer an explicit rejection found in either representation. Mobile
-    // messages may render in the chat text before the colored recruiter-bubble
-    // detector catches up; conversely, some layouts omit delivery labels.
-    const statusEvidence =
-      outgoingStatus?.status === "已拒绝"
-        ? outgoingStatus
-        : passiveStatus.status === "已拒绝"
-          ? passiveStatus
-          : outgoingStatus || passiveStatus;
+    // Rejection no longer wins unconditionally: the last signal in the whole
+    // conversation decides, so a newer invitation supersedes an older
+    // rejection instead of being locked out by it. See
+    // resolveBossStatusEvidence for the full rule.
+    const statusEvidence = resolveBossStatusEvidence(
+      passiveStatus,
+      outgoingStatus,
+    );
     return {
       status: "OK",
       value: {

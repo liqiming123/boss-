@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, EmailStr, Field, HttpUrl, field_validator
+from pydantic import BaseModel, EmailStr, Field, HttpUrl, field_validator, model_validator
+
+BOSS_NON_NAME_TEXT = re.compile(
+    r"(?:未填写|工作经历|求职意向|个人优势|测试时间|时间限制|联系方式|微信|手机号|简历|招聘|职位|沟通|好的.*感谢|谢谢|感谢|您好|你好|请问)|(?:吗|呢|呀|吧)[？?]?$"
+)
 
 
 class DevLoginRequest(BaseModel):
@@ -35,6 +40,17 @@ class ContextResolveRequest(BaseModel):
     observed_at: datetime
     client_event_id: str = Field(min_length=8, max_length=100)
     extractor_version: str = Field(min_length=1, max_length=80)
+    # Navigation source is used only to distinguish a detected unread
+    # transition from a passive page check when deciding notification cadence.
+    sync_reason: Optional[str] = Field(default=None, max_length=40)
+
+    @model_validator(mode="after")
+    def reject_uncertain_boss_candidate_name(self) -> "ContextResolveRequest":
+        """Reject obvious BOSS chat/profile sentences before they reach Bitable."""
+        compact = re.sub(r"\s+", "", self.candidate_display_name)
+        if self.platform == "boss" and BOSS_NON_NAME_TEXT.search(compact):
+            raise ValueError("BOSS_CANDIDATE_IDENTITY_UNCERTAIN")
+        return self
 
 
 class InterviewDetails(BaseModel):
@@ -91,14 +107,38 @@ class MessageSentRequest(ContextResolveRequest):
 
 class ConversationSyncRequest(MessageSentRequest):
     has_recruiter_outbound: bool
-    sync_reason: str = Field(default="CATCHUP", pattern=r"^(MESSAGE_SENT|CATCHUP|CONVERSATION_UPDATED|CANDIDATE_OPENED)$")
+    sync_reason: str = Field(default="CATCHUP", pattern=r"^(MESSAGE_SENT|CATCHUP|CONVERSATION_UPDATED|CANDIDATE_OPENED|UNREAD_CANDIDATE_OPENED|CATCHUP_RECONCILED|HISTORY_SNAPSHOT)$")
 
 
 class ScanCheckpointRequest(BaseModel):
+    """Record that one full "沟通中" poll finished, for ops monitoring only.
+
+    Polling is per-row reconciliation and deliberately anchor-free, so this
+    value never filters candidates.  It only answers "when did this BOSS
+    account last finish a complete pass?" on the operations dashboard.
+    """
+
     platform: str = Field(default="boss", pattern=r"^[a-z0-9_-]{2,30}$")
     account_display_name: str = Field(min_length=1, max_length=100)
     completed_through_at: datetime
     cursor: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConversationReconcileRequest(BaseModel):
+    """One BOSS list row, priced against the stored candidate table.
+
+    ``list_activity_at`` is the timestamp BOSS renders for that row (the
+    candidate's own top-right list time), not the chat pane's conversation
+    time.  ``list_activity_is_date_only`` marks the collapsed
+    ``09月05日`` form, which carries no clock and must be compared by day.
+    """
+
+    platform: str = Field(default="boss", pattern=r"^[a-z0-9_-]{2,30}$")
+    account_display_name: str = Field(min_length=1, max_length=100)
+    candidate_display_name: str = Field(min_length=1, max_length=120)
+    job_display_name: str = Field(min_length=1, max_length=120)
+    list_activity_at: datetime
+    list_activity_is_date_only: bool = False
 
 
 class SnapshotStatusRequest(BaseModel):

@@ -7,7 +7,7 @@ import {
   classifyBossOutgoingMessage,
   classifyBossStatus,
   hasBossRecruiterOutbound,
-  isBossInviteScreenshotTrigger,
+  resolveBossStatusEvidence,
 } from "../src/adapters/boss/boss-status";
 describe("BOSS status rules", () => {
   it("keeps interview intent separate from a scheduled interview", () => {
@@ -65,30 +65,6 @@ describe("BOSS status rules", () => {
       ),
     ).toBe(false);
   });
-  it("only asks for the intrusive chat capture when an invitation is handed out", () => {
-    expect(isBossInviteScreenshotTrigger("面试邀请已发送")).toBe(true);
-    expect(
-      isBossInviteScreenshotTrigger("已约面试，明天下午两点", undefined),
-    ).toBe(true);
-    expect(
-      isBossInviteScreenshotTrigger(undefined, {
-        status: "已约面",
-        evidence: "BOSS_INTERVIEW_MARKER",
-        ruleVersion: "boss-status-v4",
-        observedAt: new Date().toISOString(),
-      }),
-    ).toBe(true);
-    // A question is intent, not the stage change we must document.
-    expect(isBossInviteScreenshotTrigger("您好，方便明天下午面试吗")).toBe(
-      false,
-    );
-    expect(isBossInviteScreenshotTrigger("您好，想和您聊聊岗位")).toBe(false);
-    expect(isBossInviteScreenshotTrigger("简历请求已发送")).toBe(false);
-    expect(isBossInviteScreenshotTrigger("不好意思，不太合适哦 送达")).toBe(
-      false,
-    );
-    expect(isBossInviteScreenshotTrigger(undefined, undefined)).toBe(false);
-  });
   it("treats BOSS's invitation confirmation variants as a scheduled interview", () => {
     for (const marker of [
       "发送了面试邀请",
@@ -131,12 +107,70 @@ describe("BOSS status rules", () => {
       true,
     );
   });
-  it("requests the chat capture for a dialog-sent invitation with no draft", () => {
+  it("classifies a dialog-sent invitation with no draft", () => {
     const evidence = bossInterviewInviteEvidence();
     expect(evidence).toMatchObject({
       status: "已约面",
       evidence: "BOSS_INTERVIEW_INVITE",
     });
-    expect(isBossInviteScreenshotTrigger(undefined, evidence)).toBe(true);
+  });
+  it("does not read page chrome as a rejection", () => {
+    // BOSS renders “不合适” as an action button inside the conversation region.
+    expect(classifyBossStatus("不合适").status).toBe("沟通中");
+    expect(classifyBossOutgoingMessage("不合适").status).toBe("沟通中");
+    expect(
+      classifyBossStatus("求简历 换电话 换微信 查看面试 不合适").status,
+    ).toBe("沟通中");
+    // An invitation sent after the button is still an invitation.
+    expect(
+      classifyBossStatus("不合适 发送了面试邀请").status,
+    ).toBe("已约面");
+  });
+  it("does not read recruiter courtesy as a rejection", () => {
+    for (const text of [
+      "同学你好，如果觉得不合适可以随时告诉我",
+      "不合适的话也没关系，祝你顺利",
+      "如不合适请点击不合适",
+    ]) {
+      expect(classifyBossOutgoingMessage(text).status).not.toBe("已拒绝");
+    }
+  });
+  it("still recognizes every real rejection phrasing", () => {
+    for (const text of [
+      "你的经历与岗位不匹配，这次先不推进了",
+      "目前岗位已经招满，暂不考虑",
+      "本轮面试不通过",
+      "不好意思，不太合适哦 送达",
+      "对不起，看了你的简历以后觉得不太合适，希望你早日找到满意的工作机会",
+    ]) {
+      expect(classifyBossOutgoingMessage(text).status).toBe("已拒绝");
+    }
+  });
+  it("lets a newer invitation outrank an older rejection", () => {
+    // The old rejection-first rule let this combination stay 已拒绝 forever.
+    expect(
+      classifyBossStatus("不合适 后来 发送了面试邀请").status,
+    ).toBe("已约面");
+    // A genuine decline after the invitation still wins, because it is newer.
+    expect(
+      classifyBossStatus("发送了面试邀请 后来 拒接了面试邀请").status,
+    ).toBe("已拒绝");
+  });
+  it("prefers the conversation's newest signal across both representations", () => {
+    const invite = classifyBossStatus("发送了面试邀请");
+    const rejection = classifyBossStatus("不好意思，不太合适哦 送达");
+    expect(invite.status).toBe("已约面");
+    expect(rejection.status).toBe("已拒绝");
+    // Conversation text is newer than the bubbles we could classify: the
+    // invitation the recruiter actually sent must not be locked out.
+    expect(resolveBossStatusEvidence(invite, rejection).status).toBe("已约面");
+    // A rejection in the conversation outranks an older outgoing invite.
+    expect(resolveBossStatusEvidence(rejection, invite).status).toBe("已拒绝");
+    // Neutral outgoing bubbles never override a real conversation signal.
+    const neutral = classifyBossStatus("您好，想和您聊聊岗位");
+    expect(neutral.status).toBe("沟通中");
+    expect(resolveBossStatusEvidence(invite, neutral).status).toBe("已约面");
+    // Nothing readable anywhere stays neutral rather than guessing.
+    expect(resolveBossStatusEvidence(null, null).status).toBe("沟通中");
   });
 });

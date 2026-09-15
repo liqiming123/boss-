@@ -99,6 +99,19 @@ describe("Boss adapter", () => {
       value: { displayName: "顾嘉雯", experience: "1-3年", education: "本科" },
     });
   });
+  it.each([
+    "未填写工作经历",
+    "有剧本吗",
+    "测试时间有限制吗",
+    "嗯嗯好的感谢",
+  ])("never treats the chat text %s as the candidate name", async (chatText) => {
+    document.body.innerText =
+      `升级VIP\n成珈莉\n真实姓名\n${chatText}\n7年\n大专\n沟通职位：AI生成师(抽卡师)`;
+    expect(await new BossAdapter().extractCandidate()).toMatchObject({
+      status: "OK",
+      value: { displayName: "真实姓名", experience: "7年", education: "大专" },
+    });
+  });
   it("preserves graduation cohort instead of reading it as years of experience", async () => {
     document.body.innerText =
       "升级VIP\n成珈莉\n陈明俊\n22岁\n26届\n本科\n沟通职位：ai应用开发工程师\n我是26年毕业生";

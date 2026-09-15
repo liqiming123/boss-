@@ -1,4 +1,5 @@
 import { apiRequest } from "./api-client";
+import { startAlertStream, stopAlertStream } from "./alert-stream";
 import { getAuth, setAuth } from "./auth-store";
 import {
   flushMessageQueue,
@@ -21,10 +22,10 @@ const allowed = new Set([
   "CHECK_CONTEXT",
   "MESSAGE_SENT",
   "SYNC_CONVERSATION",
-  "GET_SCAN_CHECKPOINT",
+  "RECONCILE_CONVERSATION",
   "GET_CONVERSATION_INDEX",
   "GET_PLUGIN_SETTINGS",
-  "PUT_SCAN_CHECKPOINT",
+  "REPORT_SCAN_COMPLETED",
   "CAPTURE_VISIBLE_TAB",
   "UPLOAD_SNAPSHOT",
   "REPORT_SNAPSHOT_STATUS",
@@ -38,7 +39,8 @@ const routes: Record<string, string> = {
   CHECK_CONTEXT: "/plugin/context/check",
   MESSAGE_SENT: "/plugin/engagements/message-sent",
   SYNC_CONVERSATION: "/plugin/conversations/sync",
-  PUT_SCAN_CHECKPOINT: "/plugin/conversations/checkpoint",
+  RECONCILE_CONVERSATION: "/plugin/conversations/reconcile",
+  REPORT_SCAN_COMPLETED: "/plugin/conversations/scan-report",
   RECORD_EVENT: "/plugin/events",
   SEND_DIAGNOSTIC: "/plugin/diagnostics",
   REPORT_SNAPSHOT_STATUS: "/plugin/conversations/snapshot-status",
@@ -60,20 +62,21 @@ async function handle(message: unknown, sender?: chrome.runtime.MessageSender): 
     return { ok: true };
   }
   if (m.type.startsWith("DAILY_")) return dailyMessage(m.type, m.payload, sender || {});
-  if (m.type === "GET_AUTH") return getAuth();
+  if (m.type === "GET_AUTH") {
+    const state = await getAuth();
+    // The service worker is torn down when idle, so the live channel is
+    // (re)established from every entry point that proves a session exists.
+    if (state.accessToken) startAlertStream();
+    return state;
+  }
   if (m.type === "GET_BOUND_ACCOUNT") return apiRequest<{ display_name: string }>("/plugin/me");
   if (m.type === "SET_AUTH") {
     await setAuth(m.payload as Record<string, string>);
     void flushMessageQueue();
+    startAlertStream();
     return { ok: true };
   }
   if (!(await getAuth()).accessToken) throw new Error("EXTENSION_LOGGED_OUT");
-  if (m.type === "GET_SCAN_CHECKPOINT") {
-    const p = m.payload as { account_display_name: string; platform?: string };
-    return apiRequest(
-      `/plugin/conversations/checkpoint?account_display_name=${encodeURIComponent(p.account_display_name)}&platform=${encodeURIComponent(p.platform ?? "boss")}`,
-    );
-  }
   if (m.type === "GET_CONVERSATION_INDEX") {
     const p = m.payload as { account_display_name: string; platform?: string };
     return apiRequest(
@@ -139,9 +142,8 @@ async function handle(message: unknown, sender?: chrome.runtime.MessageSender): 
   try {
     return await apiRequest(route, {
       method:
-        m.type === "PUT_SCAN_CHECKPOINT" || m.type === "REPORT_SNAPSHOT_STATUS"
-          ? "PUT"
-          : "POST",
+        // Only the snapshot status is a PUT; the scan report is a POST.
+        m.type === "REPORT_SNAPSHOT_STATUS" ? "PUT" : "POST",
       body: JSON.stringify(m.payload),
     });
   } catch (error) {
@@ -176,7 +178,20 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "recruitment-message-retry") void flushMessageQueue();
   if (alarm.name === "recruitment-snapshot-retry") void flushSnapshotQueue();
 });
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  // Logout clears the tokens from any context (popup, options, other tab), so
+  // the live channel lifecycle is owned here rather than by the caller.
+  if ("accessToken" in changes) {
+    if (changes.accessToken.newValue) startAlertStream();
+    else stopAlertStream();
+  }
+});
 void flushMessageQueue();
 void flushSnapshotQueue();
 void scheduleCompanyDaily();
 void runMissedCompanyDaily();
+// The worker is also resumed on demand; reconnect if a session already exists.
+void getAuth().then((state) => {
+  if (state.accessToken) startAlertStream();
+});

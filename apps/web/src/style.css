@@ -1,7 +1,7 @@
 :root {
   font-family: Inter, "PingFang SC", system-ui, sans-serif;
   color: #172033;
-  background: #f2f5f9;
+  background: #f5f7fb;
 }
 * {
   box-sizing: border-box;
@@ -68,8 +68,20 @@ body {
   color: #64748b;
 }
 .el-main {
-  padding: 22px;
+  padding: 26px 30px 38px;
+  background: #f5f7fb;
 }
+
+/* Management console visual system: calm canvas, strong surfaces, restrained
+   accents and denser data presentation inspired by mature admin products. */
+.admin-dashboard { max-width: 1540px; }
+.admin-panel, .kpi-card { box-shadow: 0 10px 30px rgba(28, 42, 70, .055); }
+.admin-panel { border-color: #e5eaf2; }
+.admin-panel-heading h2 { color: #17233a; }
+.admin-candidate-table :deep(.el-table__row:hover > td) { background: #f3f7ff !important; }
+.admin-candidate-table :deep(.el-table__header th) { color: #66758d; font-weight: 700; background: #f8faff; }
+.admin-candidate-table :deep(.el-table__inner-wrapper::before) { display: none; }
+.side-navigation :deep(.el-menu-item-group__title) { text-transform: uppercase; }
 .page-card {
   background: #fff;
   padding: 20px;
@@ -343,6 +355,61 @@ body {
 .summary-card strong { color: #101828; font-size: 28px; }
 .validation-box, .reset-preview { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin: 16px 0; padding: 14px; background: #f8fafc; border-radius: 10px; }
 .danger-card { border-color: #fecdca; }
+
+/* Product UI baseline: quiet, dense and operational. Keep hierarchy in type
+   and spacing instead of gradients, oversized cards and decorative chrome. */
+:root {
+  color: #1f2937;
+  background: #f5f7fa;
+  --ui-ink: #1f2937;
+  --ui-muted: #667085;
+  --ui-subtle: #98a2b3;
+  --ui-line: #e5e7eb;
+  --ui-accent: #2563eb;
+}
+body { background: #f5f7fa; }
+.el-main { padding: 24px 28px 32px; }
+.page-card, .account-card, .dashboard-panel, .admin-panel, .summary-card {
+  border-color: var(--ui-line);
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(16,24,40,.03);
+}
+.summary-card { padding: 16px 18px; }
+.summary-card strong { font-size: 25px; }
+.page-heading h1, .ops-hero h1 { font-size: 24px; letter-spacing: -.025em; }
+.eyebrow, .section-kicker { letter-spacing: .08em; color: #667085; }
+.el-button--primary { --el-button-bg-color: #2563eb; --el-button-border-color: #2563eb; --el-button-hover-bg-color: #1d4ed8; --el-button-hover-border-color: #1d4ed8; }
+.el-table { --el-table-header-bg-color: #f8fafc; --el-table-row-hover-bg-color: #f8fafc; --el-table-border-color: #eef0f3; }
+.el-table th.el-table__cell { color: #667085; font-weight: 650; }
+.el-table td.el-table__cell { color: #344054; }
+.side-navigation { background: #182230 !important; border-right-color: #273445 !important; }
+.brand-mark { background: #2563eb !important; color: #fff !important; box-shadow: none !important; border-radius: 8px !important; }
+.topbar { height: 60px !important; }
+.admin-dashboard, .recruitment-dashboard { gap: 14px !important; }
+.admin-hero, .dashboard-hero {
+  background: #fff !important;
+  color: var(--ui-ink) !important;
+  border: 1px solid var(--ui-line);
+  border-radius: 8px !important;
+  box-shadow: 0 1px 2px rgba(16,24,40,.03) !important;
+}
+.admin-hero h1, .dashboard-hero h1 { color: var(--ui-ink) !important; }
+.admin-hero p, .dashboard-hero p { color: var(--ui-muted) !important; }
+.admin-kicker, .hero-kicker { color: #667085 !important; }
+.admin-hero-meta { color: #344054 !important; }
+.admin-hero-meta span:last-child { color: #98a2b3 !important; }
+.admin-extension-card, .extension-quick-card { background: #f8fafc !important; border: 1px solid var(--ui-line) !important; }
+.admin-extension-copy span, .admin-extension-copy small, .extension-copy span, .extension-copy small { color: #667085 !important; }
+.admin-extension-copy strong, .extension-copy strong { color: var(--ui-ink) !important; }
+.admin-extension-icon, .extension-icon { background: #eef4ff !important; color: #2563eb !important; }
+.admin-extension-actions button, .guide-link { color: #2563eb !important; }
+.kpi-card { border-radius: 8px !important; box-shadow: 0 1px 2px rgba(16,24,40,.03) !important; }
+.admin-panel { padding: 18px 20px; }
+.admin-panel-heading h2, .panel-heading h2 { font-size: 16px; }
+.admin-panel-heading p, .panel-heading p { color: #667085; }
+.decision-strip, .data-explainer { display: none !important; }
+.side-navigation .el-menu-item.is-active { background: #26364d !important; box-shadow: inset 3px 0 #4f8cff !important; }
+@media (max-width: 760px) { .el-main { padding: 16px 14px 24px; } }
 @media (max-width: 900px) { .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .extension-release-meta { display: flex; gap: 18px; flex-wrap: wrap; color: #667085; font-size: 12px; margin: 12px 0 16px; }
 .extension-release-meta code { color: #475467; }

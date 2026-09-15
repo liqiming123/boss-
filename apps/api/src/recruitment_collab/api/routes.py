@@ -20,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from recruitment_collab.application.collaboration import ApplicationError, RecruitmentCollaborationService
 from recruitment_collab.config.settings import get_settings
-from recruitment_collab.domain.normalization import JobNameNormalizer
+from recruitment_collab.domain.normalization import CandidateNameNormalizer, JobNameNormalizer
 from recruitment_collab.infrastructure.database import get_db
 from recruitment_collab.infrastructure.feishu import FeishuCallbackVerifier, FeishuIdentity, FeishuOAuthClient
 from recruitment_collab.infrastructure.models import (
@@ -63,6 +63,7 @@ from .schemas import (
     AliasCreate,
     BossAccountAssignmentRequest,
     ContextResolveRequest,
+    ConversationReconcileRequest,
     ConversationSyncRequest,
     DevLoginRequest,
     DiagnosticRequest,
@@ -83,7 +84,6 @@ from .schemas import (
 )
 
 router = APIRouter(prefix="/api/v1")
-HISTORICAL_RESCAN_WATERMARK = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 ADMIN_RESOURCES = {
     "recruiters": Recruiter,
@@ -402,6 +402,16 @@ def _recent_diagnostics_for_actor(db: Session, actor: Actor) -> list[dict[str, A
 
 def _aware_utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _epoch(value: datetime | None) -> float:
+    return _aware_utc(value).timestamp() if value else float("-inf")
+
+
+def _calendar_key(value: datetime) -> int:
+    """Day identity for BOSS rows that only render a calendar label."""
+    local = _aware_utc(value)
+    return local.year * 10_000 + local.month * 100 + local.day
 
 
 def _plugin_owned_sources(actor: Actor, source_id: str, related_source_ids: str, db: Session) -> tuple[CandidateSource, list[str]]:
@@ -993,34 +1003,6 @@ def sync_conversation(body: ConversationSyncRequest, actor: Actor = Depends(plug
     return RecruitmentCollaborationService(db).sync_candidate_observation(company_id, _validated_plugin_payload(body))
 
 
-@router.get("/plugin/conversations/checkpoint")
-def get_scan_checkpoint(
-    account_display_name: str = Query(min_length=1, max_length=100), platform: str = "boss", actor: Actor = Depends(plugin_actor), db: Session = Depends(get_db)
-) -> dict[str, Any]:
-    company_id = plugin_company_for_account(actor, account_display_name, db)
-    row = db.scalar(
-        select(ConversationScanCheckpoint).where(
-            ConversationScanCheckpoint.company_id == company_id,
-            ConversationScanCheckpoint.platform == platform,
-            ConversationScanCheckpoint.account_display_name == account_display_name.strip(),
-        )
-    )
-    if not row:
-        return {
-            "completed_through_at": datetime.now(timezone.utc).isoformat(),
-            "cursor": {},
-            "initial": True,
-            "historical_rescan": False,
-        }
-    cursor = row.cursor_json or {}
-    return {
-        "completed_through_at": _aware_utc(row.completed_through_at).isoformat(),
-        "cursor": cursor,
-        "initial": False,
-        "historical_rescan": cursor.get("mode") == "HISTORICAL_RESCAN",
-    }
-
-
 @router.get("/plugin/conversations/index")
 def get_conversation_index(
     account_display_name: str = Query(min_length=1, max_length=100),
@@ -1028,10 +1010,13 @@ def get_conversation_index(
     actor: Actor = Depends(plugin_actor),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Return account-scoped sync anchors used by list-first catch-up.
+    """Return this BOSS account's candidate anchors for list-first polling.
 
-    The extension compares BOSS list timestamps before opening a chat.  No
-    chat text, HTML, cookie or screenshot bytes are returned here.
+    The extension reads the BOSS list row's own timestamp and asks this
+    endpoint whether that row is already known and current.  Rows that are
+    absent, newer, or still missing their Feishu row must be opened and
+    reconciled; everything else is skipped without opening a chat.
+    No chat text, HTML, cookie or screenshot bytes are returned here.
     """
     company_id = plugin_company_for_account(actor, account_display_name, db)
     account = db.scalar(
@@ -1053,10 +1038,12 @@ def get_conversation_index(
     return {
         "items": [
             {
+                "candidate_source_id": row.id,
                 "candidate_display_name": row.candidate_display_name,
                 "job_display_name": row.raw_job_name,
                 "conversation_updated_at": _aware_utc(row.conversation_updated_at or row.created_at).isoformat(),
                 "created_at": _aware_utc(row.created_at).isoformat(),
+                "synced": row.feishu_record_id is not None,
                 "recruiter_account": account_display_name.strip(),
             }
             for row in rows
@@ -1065,90 +1052,134 @@ def get_conversation_index(
     }
 
 
-@router.post("/plugin/conversations/restart")
-def restart_scan(account_display_name: str = Query(min_length=1, max_length=100), platform: str = "boss", actor: Actor = Depends(plugin_actor), db: Session = Depends(get_db)) -> dict[str, Any]:
-    company_id = plugin_company_for_account(actor, account_display_name, db)
-    account_name = account_display_name.strip()
-    row = db.scalar(
-        select(ConversationScanCheckpoint).where(
-            ConversationScanCheckpoint.company_id == company_id,
-            ConversationScanCheckpoint.platform == platform,
-            ConversationScanCheckpoint.account_display_name == account_name,
+def _indexed_candidate_anchors(
+    company_id: str,
+    platform: str,
+    account: RecruitmentAccount,
+    db: Session,
+) -> dict[tuple[str, str], CandidateSource]:
+    """Map (normalized name, normalized job) to the newest indexed source row."""
+    rows = db.scalars(
+        select(CandidateSource).where(
+            CandidateSource.company_id == company_id,
+            CandidateSource.platform == platform,
+            CandidateSource.platform_account_id == account.id,
+        )
+    ).all()
+    anchors: dict[tuple[str, str], CandidateSource] = {}
+    name_normalizer, job_normalizer = CandidateNameNormalizer(), JobNameNormalizer()
+    for row in rows:
+        key = (name_normalizer.normalize(row.candidate_display_name), job_normalizer.normalize(row.raw_job_name))
+        existing = anchors.get(key)
+        if existing is None or _epoch(row.conversation_updated_at) > _epoch(existing.conversation_updated_at):
+            anchors[key] = row
+    return anchors
+
+
+@router.post("/plugin/conversations/reconcile")
+def reconcile_conversation(
+    body: ConversationReconcileRequest,
+    actor: Actor = Depends(plugin_actor),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Decide one BOSS list row against the stored table without opening it.
+
+    This is the whole historical-scan rule, evaluated per row instead of
+    against an account-wide watermark:
+
+    * candidate absent from the table            -> ``SYNC`` (create the row)
+    * present, but BOSS list time is newer       -> ``SYNC`` (update the row)
+    * present with the same BOSS list time       -> ``SKIP``  (nothing changed)
+    * present but its Feishu row was never sent  -> ``SYNC``  (finish the row)
+
+    BOSS only renders a clock for today/yesterday, so a row showing a bare
+    calendar label carries no hour.  Those rows are compared by calendar day
+    exactly like the reader sees them, never as midnight against a precise
+    stored timestamp.
+    """
+    company_id = plugin_company_for_account(actor, body.account_display_name, db)
+    account_name = body.account_display_name.strip()
+    account = db.scalar(
+        select(RecruitmentAccount).where(
+            RecruitmentAccount.company_id == company_id,
+            RecruitmentAccount.platform == body.platform,
+            RecruitmentAccount.account_display_name == account_name,
         )
     )
-    # Keep an explicit old anchor instead of deleting the row.  A deleted row
-    # is read as "now" by the GET endpoint, which makes every existing BOSS
-    # conversation look older and silently skips the requested historical
-    # rescan.  The cursor marker also lets operators distinguish a deliberate
-    # full rescan from the normal first-install anchor.
-    scan_id = secrets.token_urlsafe(16)
-    if row:
-        row.completed_through_at = HISTORICAL_RESCAN_WATERMARK
-        row.cursor_json = {"mode": "HISTORICAL_RESCAN", "scan_id": scan_id, "complete": False}
+    if not account:
+        raise ApplicationError("BOSS_ACCOUNT_NOT_FOUND", "当前 BOSS 账号尚未建立映射", 404)
+    anchors = _indexed_candidate_anchors(company_id, body.platform, account, db)
+    key = (
+        CandidateNameNormalizer().normalize(body.candidate_display_name),
+        JobNameNormalizer().normalize(body.job_display_name),
+    )
+    known = anchors.get(key)
+    list_activity = _aware_utc(body.list_activity_at)
+    if known is None:
+        # Never seen here: index it. This deliberately mirrors the click path,
+        # which records the row without asserting recruiter outbound evidence.
+        # A candidate the reader has actually messaged is already in the table
+        # (message-sent always creates and queues), so this cannot strand one.
+        return {"decision": "SYNC", "reason": "CANDIDATE_NOT_IN_TABLE", "known_updated_at": None}
+    known_updated_at = known.conversation_updated_at or known.created_at
+    if body.list_activity_is_date_only:
+        newer = _calendar_key(list_activity) > _calendar_key(known_updated_at)
     else:
-        row = ConversationScanCheckpoint(
-            company_id=company_id,
-            platform=platform,
-            account_display_name=account_name,
-            completed_through_at=HISTORICAL_RESCAN_WATERMARK,
-            cursor_json={"mode": "HISTORICAL_RESCAN", "scan_id": scan_id, "complete": False},
-        )
-        db.add(row)
-    db.commit()
+        newer = _epoch(list_activity) > _epoch(known_updated_at)
+    if newer:
+        decision, reason = "SYNC", "LIST_ACTIVITY_NEWER"
+    elif known.feishu_record_id is None:
+        # The row's BOSS time is unchanged, but its Feishu row was never
+        # written (e.g. indexed before this rule existed). Finish it now.
+        decision, reason = "SYNC", "FEISHU_ROW_MISSING"
+    else:
+        decision, reason = "SKIP", "LIST_ACTIVITY_UNCHANGED"
     return {
-        "accepted": True,
-        "completed_through_at": HISTORICAL_RESCAN_WATERMARK.isoformat(),
-        "historical_rescan": True,
+        "decision": decision,
+        "reason": reason,
+        "candidate_source_id": known.id,
+        "known_updated_at": _aware_utc(known_updated_at).isoformat(),
     }
 
 
-@router.put("/plugin/conversations/checkpoint")
-def put_scan_checkpoint(body: ScanCheckpointRequest, actor: Actor = Depends(plugin_actor), db: Session = Depends(get_db)) -> dict[str, Any]:
+@router.post("/plugin/conversations/scan-report")
+def report_scan_completed(
+    body: ScanCheckpointRequest,
+    actor: Actor = Depends(plugin_actor),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Record a finished poll pass for operations monitoring.
+
+    Historical scanning is now per-row reconciliation, so this value never
+    filters or anchors anything: it only feeds the dashboard's "最近同步"
+    reading for each BOSS account.
+    """
     company_id = plugin_company_for_account(actor, body.account_display_name, db)
-    if _aware_utc(body.completed_through_at) > datetime.now(timezone.utc) + timedelta(minutes=5):
-        raise ApplicationError("CHECKPOINT_TIME_INVALID", "补扫水位不能晚于服务器时间", 400)
+    reported_at = _aware_utc(body.completed_through_at)
+    if reported_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+        raise ApplicationError("CHECKPOINT_TIME_INVALID", "扫描完成时间不能晚于服务器时间", 400)
+    account_name = body.account_display_name.strip()
     row = db.scalar(
         select(ConversationScanCheckpoint).where(
             ConversationScanCheckpoint.company_id == company_id,
             ConversationScanCheckpoint.platform == body.platform,
-            ConversationScanCheckpoint.account_display_name == body.account_display_name.strip(),
+            ConversationScanCheckpoint.account_display_name == account_name,
         )
     )
-    if body.cursor.get("complete") is not True:
-        # Older extensions reported the newest individual candidate as if an
-        # entire newest-to-oldest traversal had completed. Never let a partial
-        # report move the high-water mark past candidates that were not seen.
-        completed = row.completed_through_at if row else datetime.now(timezone.utc)
-        return {"completed_through_at": _aware_utc(completed).isoformat(), "cursor": row.cursor_json if row else {}, "accepted": False}
-    if row and (row.cursor_json or {}).get("mode") == "HISTORICAL_RESCAN":
-        # A stale tab may finish an older incremental pass after an operator
-        # has requested a historical rescan.  It must not advance the new
-        # epoch anchor back to "now"; only the tab carrying this rescan's
-        # server-issued scan id may complete it.
-        expected_scan_id = (row.cursor_json or {}).get("scan_id")
-        if not expected_scan_id or body.cursor.get("scan_id") != expected_scan_id:
-            return {
-                "completed_through_at": _aware_utc(row.completed_through_at).isoformat(),
-                "cursor": row.cursor_json or {},
-                "accepted": False,
-            }
-    if row:
-        stored = row.completed_through_at if row.completed_through_at.tzinfo else row.completed_through_at.replace(tzinfo=timezone.utc)
-        incoming = body.completed_through_at if body.completed_through_at.tzinfo else body.completed_through_at.replace(tzinfo=timezone.utc)
-        if incoming > stored:
-            row.completed_through_at = body.completed_through_at
-        row.cursor_json = body.cursor
-    else:
+    if row is None:
         row = ConversationScanCheckpoint(
             company_id=company_id,
             platform=body.platform,
-            account_display_name=body.account_display_name.strip(),
-            completed_through_at=body.completed_through_at,
+            account_display_name=account_name,
+            completed_through_at=reported_at,
             cursor_json=body.cursor,
         )
         db.add(row)
+    else:
+        row.completed_through_at = reported_at
+        row.cursor_json = body.cursor
     db.commit()
-    return {"completed_through_at": _aware_utc(row.completed_through_at).isoformat(), "cursor": row.cursor_json, "accepted": True}
+    return {"completed_through_at": reported_at.isoformat(), "accepted": True}
 
 
 @router.post("/plugin/conversations/{source_id}/snapshot")

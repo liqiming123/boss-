@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,7 @@ from recruitment_collab.infrastructure.models import (
     UnmappedJob,
     now,
 )
+from recruitment_collab.infrastructure.realtime import realtime_bus
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,21 @@ def _iso_time(value: Any) -> str | None:
     if isinstance(value, datetime):
         return value.replace(tzinfo=value.tzinfo or timezone.utc).isoformat()
     return str(value)
+
+
+def _canonical_job_name(value: str) -> str:
+    """Remove BOSS page metadata accidentally appended to the job title.
+
+    A list row's text can leak into the extracted job, producing values such as
+    ``短视频美妆达人 最近关注: 无锡 · 主播 6-11K 17:58 9月11日 沟通的职位-短视频美妆达人 送达``.
+    That extra text must never become part of the candidate's identity.
+    """
+    text = str(value or "")
+    for marker in (" 最近关注", "最近关注", " 沟通的职位", "沟通的职位", " 送达", "送达"):
+        text = text.split(marker, 1)[0]
+    # A leaked date/time tail means the list row was captured with the title.
+    text = re.split(r"\s+\d{1,2}月\d{1,2}日", text, maxsplit=1)[0]
+    return text.strip()
 
 
 STATUS_RANK = {"沟通中": 0, "已获取简历": 1, "已交换联系方式": 2, "待约面": 3, "已约面": 4, "已拒绝": 5, "已入职": 6}
@@ -95,12 +112,89 @@ class MessageContext:
     payload: dict[str, Any]
 
 
+# Evidence names the extension uses when the recruiter actually handed out an
+# interview invitation, as opposed to merely expressing intent.
+INTERVIEW_INVITE_EVIDENCE = frozenset({"BOSS_INTERVIEW_MARKER", "BOSS_INTERVIEW_INVITE"})
+# Rejection read from the conversation text rather than from a confirmed
+# outbound bubble. That reading can be wrong (BOSS renders a “不合适” action
+# button inside the conversation region), so a later invitation is allowed to
+# replace it. A rejection confirmed as the recruiter's own outbound message
+# keeps the old terminal behaviour.
+PASSIVE_REJECTION_EVIDENCE = "EXPLICIT_REJECTION"
+
+
+def _sort_epoch(value: Any) -> float:
+    """Comparable timestamp for values that may be a datetime, an ISO string or
+    a millisecond epoch, as returned by the local index and the Feishu table."""
+    if value is None:
+        return float("inf")
+    if isinstance(value, datetime):
+        return _epoch(value)
+    if isinstance(value, (int, float)):
+        # Bitable timestamps arrive in milliseconds.
+        number = float(value)
+        return number / 1000 if number > 1e11 else number
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return float("inf")
+
+
+def _latest_epoch(value: Any) -> float:
+    """Comparable activity timestamp where missing data sorts oldest."""
+    parsed = _sort_epoch(value)
+    return float("-inf") if parsed == float("inf") else parsed
+
+
+def _newest_time(*values: Any) -> Any:
+    """The newest of several optional timestamps, or None when none is usable.
+
+    Used to rank recruiters by the moment they really talked to the candidate.
+    ``None``/unparseable values lose against every real timestamp instead of
+    silently falling back to an older field, which is what previously made a
+    confirmed outbound message rank below a colleague's stored row time.
+    """
+    best: Any = None
+    best_epoch = float("-inf")
+    for value in values:
+        epoch = _latest_epoch(value)
+        if epoch > best_epoch:
+            best, best_epoch = value, epoch
+    return best
+
+
+def _card_detail(name: str, job_name: str, match_reason: str, first_contact_at: Any, last_activity_at: Any) -> dict[str, Any]:
+    """One "other recruiter" line of the duplicate-lookup card."""
+    return {
+        "recruiter_name": name,
+        "job_name": job_name,
+        "match_reason": match_reason,
+        "first_contact_at": _iso_time(first_contact_at),
+        "last_activity_at": _iso_time(last_activity_at),
+    }
+
+
+def _profile_conflicts(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """True when two observations cannot be the same person.
+
+    Only ``age`` is treated as a durable fact. Experience and education are
+    read from whichever resume section happens to be rendered and drift between
+    scans on the very same person (``26届`` vs ``26年``, ``3年`` vs a degree
+    line), so they are supporting evidence for a match, never grounds to split
+    it into two rows.
+    """
+    first = left.get("age")
+    second = right.get("age")
+    return bool(first and second and str(first) != str(second))
+
+
 def _accepted_status(
     current: str,
     incoming: str | None,
     evidence: str | None,
     current_rule_version: str = "boss-status-v1",
     incoming_rule_version: str | None = None,
+    current_evidence: str | None = None,
 ) -> tuple[str, str | None] | None:
     if not incoming or not evidence:
         return None
@@ -114,7 +208,15 @@ def _accepted_status(
         } and incoming_rule_version == "boss-status-v3"
         return ("沟通中", evidence) if stale_false_positive else None
     if current in TERMINAL_STATUSES:
-        return (incoming, evidence) if incoming in TERMINAL_STATUSES and incoming != current else None
+        if incoming in TERMINAL_STATUSES and incoming != current:
+            return incoming, evidence
+        # The candidate was marked 已拒绝 from the conversation text, but the
+        # recruiter has since sent an interview invitation. The invitation is
+        # the newer business fact; without this the candidate stayed 已拒绝
+        # forever and never reached the table as 已约面.
+        if incoming == "已约面" and evidence in INTERVIEW_INVITE_EVIDENCE and current_evidence == PASSIVE_REJECTION_EVIDENCE:
+            return incoming, evidence
+        return None
     if incoming in TERMINAL_STATUSES or STATUS_RANK.get(incoming, -1) >= STATUS_RANK.get(current, 0):
         return incoming, evidence
     return None
@@ -164,6 +266,10 @@ class RecruitmentCollaborationService:
                     payload["job_display_name"],
                     job.canonical_name if job else "",
                     recruiter_label,
+                    payload.get("candidate_age"),
+                    payload.get("candidate_experience") or "",
+                    payload.get("candidate_education") or "",
+                    payload.get("account_display_name") or "",
                 )
                 # Keep compatibility with rows written before the field
                 # projection was reduced. New rows are matched from the
@@ -177,7 +283,14 @@ class RecruitmentCollaborationService:
                 feishu_available = False
         else:
             pass
-        matches = self._merge_native_matches(payload.get("native_communications") or [], payload["account_display_name"], matches, feishu_available)
+        current_aliases = {
+            str(payload.get("account_display_name") or ""),
+            recruiter_label,
+            current_recruiter.display_name if current_recruiter else "",
+            current_recruiter.feishu_display_name if current_recruiter and current_recruiter.feishu_display_name else "",
+        }
+        current_jobs = {payload["job_display_name"], job.canonical_name if job else ""}
+        matches = self._merge_native_matches(payload.get("native_communications") or [], current_aliases, current_jobs, matches, feishu_available)
         queued = self._queue_lookup_alerts(company_id, current_recruiter, payload, matches)
         if queued:
             self.session.commit()
@@ -190,18 +303,21 @@ class RecruitmentCollaborationService:
 
     @staticmethod
     def _merge_native_matches(
-        native_rows: list[dict[str, Any]], current_recruiter: str, feishu_matches: list[dict[str, Any]], feishu_available: bool
+        native_rows: list[dict[str, Any]], current_recruiter_aliases: set[str], current_job_names: set[str],
+        feishu_matches: list[dict[str, Any]], feishu_available: bool
     ) -> list[dict[str, Any]]:
         normalize_job = JobNameNormalizer().normalize
         normalize_name = CandidateNameNormalizer().normalize
-        current = normalize_name(current_recruiter)
+        current = {normalize_name(value) for value in current_recruiter_aliases if value.strip()}
+        current_jobs = {normalize_job(value) for value in current_job_names if value.strip()}
         by_key = {(normalize_name(item["recruiter_name"]), normalize_job(item.get("job_name") or "")): item for item in feishu_matches}
         merged: list[dict[str, Any]] = []
         consumed: set[int] = set()
         for row in native_rows:
             recruiter = str(row.get("recruiter_name") or "").strip()
             job_name = str(row.get("job_name") or "").strip()
-            if not recruiter or not job_name or normalize_name(recruiter) == current:
+            same_owner_and_job = normalize_name(recruiter) in current and normalize_job(job_name) in current_jobs
+            if not recruiter or not job_name or same_owner_and_job:
                 continue
             key = (normalize_name(recruiter), normalize_job(job_name))
             feishu = by_key.get(key)
@@ -235,7 +351,13 @@ class RecruitmentCollaborationService:
                     "history": {"contacted": True, "interviewed": False, "rejected": False, "event_types": []},
                 }
             merged.append(item)
-        merged.extend(item for item in feishu_matches if id(item) not in consumed)
+        merged.extend(
+            item for item in feishu_matches
+            if id(item) not in consumed and not (
+                normalize_name(str(item.get("recruiter_name") or "")) in current
+                and normalize_job(str(item.get("job_name") or "")) in current_jobs
+            )
+        )
         return sorted(merged, key=lambda item: (item.get("match_level") == "CONFIRMED_BOSS_HISTORY", str(item.get("updated_at") or "")), reverse=True)
 
     @staticmethod
@@ -256,7 +378,9 @@ class RecruitmentCollaborationService:
         return (recruiter.feishu_display_name if recruiter and recruiter.feishu_display_name else (recruiter.display_name if recruiter else fallback)).strip()
 
     def _feishu_matches(
-        self, company_id: str, signature: str | None, candidate_name: str, job_name: str, canonical_job_name: str, current_recruiter: str
+        self, company_id: str, signature: str | None, candidate_name: str, job_name: str, canonical_job_name: str,
+        current_recruiter: str, candidate_age: int | None = None, candidate_experience: str = "", candidate_education: str = "",
+        current_boss_account: str = ""
     ) -> list[dict[str, Any]]:
         settings = get_settings()
         config = self.session.scalar(
@@ -267,7 +391,10 @@ class RecruitmentCollaborationService:
             app_token=config.app_token if config else None,
             candidate_table_id=config.candidate_table_id if config else None,
         )
-        rows = client.find_system_candidates(signature, current_recruiter, candidate_name, job_name, canonical_job_name)
+        rows = client.find_system_candidates(
+            signature, current_recruiter, candidate_name, job_name, canonical_job_name,
+            candidate_age, candidate_experience, candidate_education, current_boss_account,
+        )
         matches = []
         for row in rows:
             updated_at = row.get("更新时间")
@@ -303,9 +430,16 @@ class RecruitmentCollaborationService:
         identity = (
             self._identity_signature(payload) or hashlib.sha256(CandidateNameNormalizer().normalize(payload["candidate_display_name"]).encode()).hexdigest()
         )
-        normalized_job = JobNameNormalizer().normalize(payload["job_display_name"])
+        normalized_job = JobNameNormalizer().normalize(_canonical_job_name(payload["job_display_name"]))
         queued_count = 0
         current_time = now()
+        viewer_label = self._recruiter_label(viewer, viewer.display_name)
+        # One candidate, one listener, one card: every colleague who already
+        # holds the candidate is listed in the same message. Alert rows are
+        # still per colleague (they carry the cooldown and the audit trail),
+        # but the notification is queued once per lookup instead of once per
+        # colleague — a three-colleague hit used to send three identical cards.
+        group: list[dict[str, Any]] = []
         for match in matches:
             rank = ranks.get(str(match.get("match_level")))
             if not rank:
@@ -316,8 +450,25 @@ class RecruitmentCollaborationService:
             matched = self.session.get(Recruiter, match.get("recruiter_id")) if match.get("recruiter_id") else None
             if not matched:
                 matched = self._recruiter_by_label(company_id, matched_name)
+            # BOSS may show the account nickname while its native history shows
+            # the bound Feishu real name. Resolve both labels before deciding
+            # that there are two recruiters; otherwise 李先生/李启明 becomes a
+            # false self-duplicate.
+            same_job = JobNameNormalizer().normalize(_canonical_job_name(str(match.get("job_name") or ""))) == normalized_job
+            if matched and matched.id == viewer.id and same_job:
+                continue
+            viewer_aliases = {
+                CandidateNameNormalizer().normalize(value)
+                for value in (viewer.display_name, viewer.feishu_display_name or "", viewer_label)
+                if value
+            }
+            if CandidateNameNormalizer().normalize(matched_name) in viewer_aliases and same_job:
+                continue
             target_key = matched.id if matched else CandidateNameNormalizer().normalize(matched_name)
-            alert_key = hashlib.sha256(f"{company_id}|{viewer.id}|{target_key}|{identity}|{normalized_job}".encode()).hexdigest()
+            # A candidate's identity is independent of the job they were viewed under.
+            # Omitting the job prevents补扫 across multiple岗位 from producing
+            # duplicate alerts for the same viewer/colleague pair.
+            alert_key = hashlib.sha256(f"{company_id}|{viewer.id}|{target_key}|{identity}".encode()).hexdigest()
             alert = self._activate_lookup_alert(
                 DuplicateLookupAlert(
                     company_id=company_id,
@@ -332,43 +483,184 @@ class RecruitmentCollaborationService:
                     match_reason=str(match.get("match_reason") or "发现重复候选人证据"),
                 ),
                 current_time,
+                # Only a genuine unread→read transition (a real, time-sensitive
+                # signal) bypasses the alert cooldown. A reconciliation pass
+                # merely observed a newer list time; treating that as "unread"
+                # pinged colleagues on every poll.
+                force_notify=payload.get("sync_reason") == "UNREAD_CANDIDATE_OPENED",
             )
             if not alert:
+                # Cooldown or a racing request: this colleague is already known
+                # to the viewer, so the card has nothing new to say.
                 continue
             alert.notification_version += 1
-            viewer_label = self._recruiter_label(viewer, viewer.display_name)
-            payload_json = {
-                "type": "DUPLICATE_LOOKUP",
-                "lookup_alert_id": alert.id,
-                "candidate_name": payload["candidate_display_name"],
-                "job_name": payload["job_display_name"],
-                "viewer_name": viewer_label,
-                "matched_recruiter_name": matched_name,
-                "first_contact_at": _iso_time(match.get("first_contact_at")),
-                "last_activity_at": _iso_time(match.get("last_activity_at") or match.get("updated_at")),
-                "current_action": "你正在查看该候选人，尚未确认发送消息",
-                "match_level": alert.match_level,
-                "match_reason": alert.match_reason,
-            }
-            # Browsing a candidate is not a follow-up action, so only the person
-            # who is looking at it is warned. The recruiter who already
-            # contacted the candidate is deliberately NOT pinged here: the
-            # previous behaviour alerted them every time a colleague merely
-            # opened the profile, which is pure noise. They are notified only
-            # once a real message is sent and a conflict is recorded.
-            recipients = {viewer.id}
-            created = self._queue_notifications(
-                company_id,
-                "DUPLICATE_LOOKUP",
-                "lookup_alert",
-                alert.id,
-                payload_json,
-                recipients,
-                f"lookup:{alert.id}:v{alert.notification_version}",
+            first_contact_at = match.get("first_contact_at")
+            last_activity_at = match.get("last_activity_at") or match.get("updated_at")
+            group.append(
+                {
+                    "alert": alert,
+                    "matched": matched,
+                    "name": matched_name,
+                    "rank": rank,
+                    "match_level": str(match["match_level"]),
+                    "match_reason": str(match.get("match_reason") or "发现重复候选人证据"),
+                    "first_contact_at": first_contact_at,
+                    "last_activity_at": last_activity_at,
+                    "job_name": str(match.get("job_name") or ""),
+                    "stage": match.get("stage") or "沟通中",
+                }
             )
-            if created:
-                alert.last_notified_at = current_time
-                queued_count += created
+        if not group:
+            return 0
+        # The same colleague can be observed twice — once in the local index and
+        # once in the Feishu table — and those are one person, one card line.
+        deduped_group: dict[str, dict[str, Any]] = {}
+        for item in group:
+            key = item["matched"].id if item["matched"] else f"unresolved:{CandidateNameNormalizer().normalize(item['name'])}"
+            existing = deduped_group.get(key)
+            if existing is None or (item["rank"], -_sort_epoch(item["first_contact_at"])) > (existing["rank"], -_sort_epoch(existing["first_contact_at"])):
+                deduped_group[key] = item
+        group = list(deduped_group.values())
+        # The card lists every colleague; the strongest evidence leads, and ties
+        # go to whoever spoke to the candidate first.
+        group.sort(key=lambda item: (-item["rank"], _sort_epoch(item["first_contact_at"])))
+        primary = group[0]
+        alert = primary["alert"]
+        # Notify exactly one person: the recruiter whose *real* conversation with
+        # this candidate is the newest. A confirmed outbound message is a real
+        # conversation and therefore always counts — the send instant used to be
+        # ignored, so a colleague whose stored row was merely re-read later
+        # looked "newer" than the recruiter writing to the candidate right now,
+        # and the reminder was delivered to the wrong person.
+        participants: dict[str, dict[str, Any]] = {
+            viewer.id: {
+                "recruiter": viewer,
+                "name": viewer_label,
+                "is_viewer": True,
+                "last_activity_at": _newest_time(
+                    payload.get("sent_at"),
+                    payload.get("conversation_updated_at"),
+                    payload.get("conversation_started_at"),
+                ),
+                "first_contact_at": payload.get("conversation_started_at"),
+                "job_name": payload["job_display_name"],
+                "match_reason": "该同事刚刚沟通了同一候选人" if payload.get("sent_at") else "该同事正在查看该候选人",
+            }
+        }
+        for item in group:
+            recruiter = item["matched"]
+            candidate = {
+                "recruiter": recruiter,
+                "name": item["name"],
+                "is_viewer": False,
+                "last_activity_at": item["last_activity_at"] or item["first_contact_at"],
+                "first_contact_at": item["first_contact_at"],
+                "job_name": item["job_name"] or payload["job_display_name"],
+                "match_reason": item["match_reason"],
+            }
+            participant_key = recruiter.id if recruiter else f"unresolved:{CandidateNameNormalizer().normalize(item['name'])}"
+            previous = participants.get(participant_key)
+            if previous is None or _latest_epoch(candidate["last_activity_at"]) > _latest_epoch(previous["last_activity_at"]):
+                participants[participant_key] = candidate
+        cross_job = any(
+            JobNameNormalizer().normalize(_canonical_job_name(str(item.get("job_name") or ""))) != normalized_job
+            for item in matches
+            if item.get("job_name")
+        )
+        if len(participants) < 2 and not cross_job:
+            return 0
+        # On an exact timestamp tie, prefer the current page owner: this is
+        # deterministic and avoids pinging a colleague based on indistinguishable
+        # data. Otherwise the greatest real conversation timestamp wins.
+        latest = max(
+            participants.values(),
+            key=lambda item: (_latest_epoch(item["last_activity_at"]), bool(item["is_viewer"])),
+        )
+        # A native BOSS label that has not been bound to a Feishu recruiter has
+        # no safe direct-message target. Keep the in-page warning, but never
+        # redirect their alert to a different person merely because that person
+        # is the only resolvable account.
+        if latest["recruiter"] is None:
+            return 0
+        # The card always describes somebody other than its recipient. When the
+        # newest real conversation belongs to a colleague, that colleague is the
+        # one being warned, and the recruiter on this page is who they are warned
+        # about: the recipient's own name must never be echoed back as the
+        # colleague who "already" holds the candidate.
+        if latest["is_viewer"]:
+            others = [
+                _card_detail(item["name"], item["job_name"] or payload["job_display_name"], item["match_reason"], item["first_contact_at"], item["last_activity_at"])
+                for item in group
+            ]
+            lead_recruiter_id = primary["matched"].id if primary["matched"] else None
+        else:
+            others = [
+                _card_detail(entry["name"], entry["job_name"], entry["match_reason"], entry["first_contact_at"], entry["last_activity_at"])
+                for entry in participants.values()
+                if entry is not latest
+            ]
+            lead_recruiter_id = viewer.id
+        if not others:
+            return 0
+        lead = others[0]
+        payload_json = {
+            "type": "DUPLICATE_LOOKUP",
+            "lookup_alert_id": alert.id,
+            "candidate_name": payload["candidate_display_name"],
+            "job_name": payload["job_display_name"],
+            "viewer_name": viewer_label,
+            "recipient_is_viewer": bool(latest["is_viewer"]),
+            "trigger": "SEND" if payload.get("sent_at") else "BROWSE",
+            "matched_recruiter_name": lead["recruiter_name"],
+            "matched_recruiter_names": [item["recruiter_name"] for item in others],
+            "matched_recruiter_details": others,
+            "matched_colleague_count": len(others),
+            "first_contact_at": lead["first_contact_at"],
+            "last_activity_at": lead["last_activity_at"],
+            "current_recruiter_status": payload.get("recruitment_status") or "待建立跟进记录",
+            "candidate_status": "沟通中" if primary.get("stage") == "FOLLOWING" else (primary.get("stage") or "沟通中"),
+            "match_level": alert.match_level,
+            "match_reason": lead["match_reason"],
+        }
+        # One card per lookup, always to the recruiter whose real conversation is
+        # the newest. A colleague is only chosen when that colleague really spoke
+        # to the candidate more recently than the person on the page.
+        recipients = {latest["recruiter"].id}
+        created = self._queue_notifications(
+            company_id,
+            "DUPLICATE_LOOKUP",
+            "lookup_alert",
+            alert.id,
+            payload_json,
+            recipients,
+            f"lookup:{alert.id}:v{alert.notification_version}",
+        )
+        if created:
+            # Every alert in the group shares this notification, so each keeps
+            # its own cooldown in step and will not re-fire on the next poll.
+            for item in group:
+                item["alert"].last_notified_at = current_time
+            queued_count += created
+            realtime_bus.publish(
+                company_id,
+                {
+                    "event": "duplicate_lookup",
+                    "recipient_recruiter_id": latest["recruiter"].id,
+                    "lookup_alert_id": alert.id,
+                    "candidate_name": payload["candidate_display_name"],
+                    "candidate_identity_hash": identity,
+                    "job_name": payload["job_display_name"],
+                    "viewer_recruiter_id": viewer.id,
+                    "viewer_name": viewer_label,
+                    "matched_recruiter_id": lead_recruiter_id,
+                    "matched_recruiter_name": lead["recruiter_name"],
+                    "match_level": alert.match_level,
+                    "match_reason": alert.match_reason,
+                    "first_contact_at": lead["first_contact_at"],
+                    "last_activity_at": lead["last_activity_at"],
+                    "notification_version": alert.notification_version,
+                },
+            )
         return queued_count
 
     def _recruiter_by_label(self, company_id: str, label: str) -> Recruiter | None:
@@ -397,7 +689,7 @@ class RecruitmentCollaborationService:
             )
         )
 
-    def _activate_lookup_alert(self, draft: DuplicateLookupAlert, detected_at: datetime) -> DuplicateLookupAlert | None:
+    def _activate_lookup_alert(self, draft: DuplicateLookupAlert, detected_at: datetime, force_notify: bool = False) -> DuplicateLookupAlert | None:
         alert = self.session.scalar(select(DuplicateLookupAlert).where(DuplicateLookupAlert.alert_key == draft.alert_key))
         if alert:
             alert.hit_count += 1
@@ -405,8 +697,14 @@ class RecruitmentCollaborationService:
             last_notified = alert.last_notified_at
             if last_notified and not last_notified.tzinfo:
                 last_notified = last_notified.replace(tzinfo=timezone.utc)
-            cooldown_elapsed = not last_notified or detected_at - last_notified >= timedelta(hours=24)
-            if draft.evidence_rank <= alert.evidence_rank and not cooldown_elapsed:
+            # Cross-account duplicate evidence is actionable immediately: the
+            # viewer is sitting on the candidate right now. Re-notify as soon
+            # as new evidence appears, or after the short configurable window
+            # that only exists to stop the same person re-opening the same
+            # candidate from generating a stream of identical messages.
+            cooldown = timedelta(minutes=max(0, get_settings().lookup_alert_cooldown_minutes))
+            cooldown_elapsed = not last_notified or not cooldown or detected_at - last_notified >= cooldown
+            if draft.evidence_rank <= alert.evidence_rank and not cooldown_elapsed and not force_notify:
                 return None
             alert.match_level = draft.match_level
             alert.evidence_rank = draft.evidence_rank
@@ -622,16 +920,23 @@ class RecruitmentCollaborationService:
         lookup_notifications_queued = self._queue_lookup_alerts(company_id, current_recruiter, payload, matches)
         self._create_conflicts(source, page.actor_id, company_id)
         result = self._commit_candidate_response(source, account, job, current_recruiter, matches)
-        result["snapshot_needed"] = invite_confirmed
+        # A send never asks for a screenshot, not even the interview invitation:
+        # capturing scrolls the recruiter's own pane, and the invitation usually
+        # arrives mid-conversation with more typing to follow. The chat long
+        # image comes from the scheduled/manual history pass (one per read
+        # conversation), plus the missing-image retry above. An invitation still
+        # records the interview row and advances the status.
+        result["snapshot_needed"] = False
         result["lookup_notifications_queued"] = lookup_notifications_queued
         return result
 
     def sync_candidate_observation(self, company_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Persist a candidate opened in BOSS without claiming a message was sent.
+        """Click-to-sync: persist a candidate opened in BOSS without claiming a message was sent.
 
-        Candidate selection is the synchronization trigger for every recruiter.
-        A real outbound message still goes through ``record_message_sent`` so
-        engagements and MESSAGE_SENT events retain their business meaning.
+        The shared table follows the conversation: an unknown candidate gets its
+        row, and a newer conversation time refreshes that row's 更新时间. The
+        observation still creates no engagement, no ``MESSAGE_SENT`` event and no
+        screenshot; real outbound messages go through ``record_message_sent``.
         """
         account, current_recruiter = self._page_identity(company_id, payload, create=True)
         if not account or not current_recruiter:
@@ -650,7 +955,7 @@ class RecruitmentCollaborationService:
                     CandidateSource.candidate_normalized_name == normalized_name,
                 )
             ).all()
-            if JobNameNormalizer().normalize(row.raw_job_name) == normalized_job
+            if JobNameNormalizer().normalize(_canonical_job_name(row.raw_job_name)) == normalized_job
         ]
         prior = max(
             prior_candidates,
@@ -661,24 +966,33 @@ class RecruitmentCollaborationService:
         source, _started_at, _updated_at, _invite_confirmed = self._upsert_candidate_source(context)
         matches = self._find_matches(source, page.actor_id, company_id, job.category if job else None)
         incoming_updated_at = payload.get("conversation_updated_at") or payload["sent_at"]
+        sync_reason = str(payload.get("sync_reason") or "CANDIDATE_OPENED")
         if prior_updated_at and _epoch(incoming_updated_at) <= _epoch(prior_updated_at):
+            # Nothing moved. Re-opening a conversation that the table already
+            # knows must not create another Feishu write.
             result = self._response(source, account, job, current_recruiter, matches)
             self.session.commit()
             result["feishu_sync_status"] = "UNCHANGED"
-            result["snapshot_needed"] = False
+            result["snapshot_needed"] = sync_reason == "HISTORY_SNAPSHOT"
             result["lookup_notifications_queued"] = 0
-            result["sync_trigger"] = "CANDIDATE_OPENED"
+            result["sync_trigger"] = sync_reason
             return result
+        # 点击即同步: the candidate is new to this account, or this observation
+        # really carries a newer conversation time, so the shared table gets its
+        # row now (created, or refreshed with the newest message time). A passive
+        # "just looked at it" never invents a follow-up relationship, a
+        # MESSAGE_SENT event or a screenshot — only the row and its times.
         result = self._commit_candidate_response(source, account, job, current_recruiter, matches)
-        # Opening a conversation must never request the historical chat
-        # capture: it scrolls the recruiter's own pane. Screenshots are asked
-        # for only by a confirmed interview invitation (record_message_sent).
-        result["snapshot_needed"] = False
+        # Screenshots belong to the scheduled/manual history pass (which covers
+        # the current day's conversations) and to the interview invitation
+        # handled in ``record_message_sent``. Nothing else captures, so a
+        # recruiter is never photographed mid-typing.
+        result["snapshot_needed"] = sync_reason == "HISTORY_SNAPSHOT"
         # The read-only context check owns click-time notifications. Keeping
         # this write path notification-free allows lookup and persistence to
         # run independently without duplicate-alert races.
         result["lookup_notifications_queued"] = 0
-        result["sync_trigger"] = "CANDIDATE_OPENED"
+        result["sync_trigger"] = sync_reason
         return result
 
     def _existing_message_response(
@@ -704,23 +1018,15 @@ class RecruitmentCollaborationService:
             matches,
             idempotent=True,
         )
-        # A catch-up scan reuses its deterministic idempotency key. If the
-        # original attempt carried an interview invitation but the screenshot
-        # upload failed, the idempotent response must still ask the extension
-        # to capture again; otherwise a transient capture error becomes
-        # permanent and the source remains FAILED forever. A non-invite retry
-        # must stay silent even when an old snapshot is missing.
-        invite_message = (
-            payload.get("recruitment_status") == INVITE_STATUS
-            or payload.get("status_evidence") in INVITE_EVIDENCE
-        )
-        result["snapshot_needed"] = invite_message and (
+        # An idempotent send retry still requests a missing/failed snapshot;
+        # this is independent of the candidate's interview status.
+        result["snapshot_needed"] = (
             source.snapshot_status != "READY" or not source.snapshot_tokens_json
         )
         return result
 
     def _resolve_job(self, company_id: str, payload: dict[str, Any], *, track_unmapped: bool = False) -> tuple[RecruitmentJob | None, str]:
-        normalized_job = JobNameNormalizer().normalize(payload["job_display_name"])
+        normalized_job = JobNameNormalizer().normalize(_canonical_job_name(payload["job_display_name"]))
         alias = self.session.scalar(
             select(JobAlias).where(
                 JobAlias.company_id == company_id,
@@ -762,7 +1068,7 @@ class RecruitmentCollaborationService:
             payload["platform"],
             source_scope,
             signature or payload["candidate_display_name"],
-            payload["job_display_name"],
+            _canonical_job_name(payload["job_display_name"]),
             identity_page_hash,
             payload.get("platform_candidate_id"),
         )
@@ -774,10 +1080,9 @@ class RecruitmentCollaborationService:
         normalized_name = CandidateNameNormalizer().normalize(payload["candidate_display_name"])
         conversation_job_key = hashlib.sha256(f"{page.actor_id}|{signature or normalized_name}|{context.normalized_job}".encode()).hexdigest()
         source = self._find_candidate_source(context, identity, normalized_name, signature)
-        # A screenshot is an evidence artifact for the interview invitation,
-        # not for browsing. Passive observations therefore never request one;
-        # a confirmed send asks for a capture only when it actually hands the
-        # candidate an invitation.
+        # Interview confirmation controls only interview persistence and the
+        # one send that also asks for a fresh screenshot. The scheduled history
+        # pass captures every read row independently of any status.
         invite_confirmed = confirmed_send and (
             payload.get("recruitment_status") == INVITE_STATUS
             or payload.get("status_evidence") in INVITE_EVIDENCE
@@ -787,7 +1092,7 @@ class RecruitmentCollaborationService:
             "candidate_normalized_name": normalized_name,
             "candidate_identity_signature": signature,
             "conversation_job_key": conversation_job_key,
-            "raw_job_name": payload["job_display_name"],
+            "raw_job_name": _canonical_job_name(payload["job_display_name"]),
             "page_url_hash": url_hash,
             "platform_candidate_id": payload.get("platform_candidate_id"),
         }
@@ -816,6 +1121,7 @@ class RecruitmentCollaborationService:
                 payload.get("status_evidence"),
                 source.status_rule_version,
                 payload.get("status_rule_version"),
+                source.status_evidence,
             )
             if payload.get("status_evidence") == "RECRUITER_RECONTACT_INTENT":
                 # Only a newer confirmed outbound event can reopen an old
@@ -855,8 +1161,8 @@ class RecruitmentCollaborationService:
         )
         self.session.add(source)
         self.session.flush()
-        # A brand-new source is only persisted here; whether it also needs a
-        # screenshot still depends on why it was created (see invite_confirmed).
+        # A brand-new source is persisted here; the caller decides whether the
+        # current workflow also captures its conversation.
         return source, conversation_started_at, conversation_updated_at, invite_confirmed
 
     def _find_candidate_source(
@@ -877,25 +1183,33 @@ class RecruitmentCollaborationService:
             legacy_conditions.append(CandidateSource.platform_candidate_id == payload["platform_candidate_id"])
         if signature:
             legacy_conditions.append(and_(CandidateSource.candidate_normalized_name == normalized_name, CandidateSource.candidate_identity_signature.is_(None)))
-        if not legacy_conditions:
-            return None
-        rows = self.session.scalars(
-            select(CandidateSource).where(
-                CandidateSource.company_id == page.company_id,
-                CandidateSource.platform == payload["platform"],
-                CandidateSource.platform_account_id == page.account.id,
-                or_(*legacy_conditions),
-            )
-        ).all()
-        source = next((row for row in rows if JobNameNormalizer().normalize(row.raw_job_name) == context.normalized_job), None)
-        if source:
-            source.source_identity_key = identity
-            return source
-        # BOSS can change the exposed identity details (and therefore the
-        # derived signature) after a resume/profile refresh. For the same
-        # recruiter, reuse the existing name+job row instead of creating a
-        # second row. Recruiter ownership remains part of the source scope,
-        # so a different recruiter still creates a separate row.
+        canonical_job = JobNameNormalizer().normalize(_canonical_job_name(payload["job_display_name"]))
+        # Legacy rows written before the signature columns existed are matched
+        # by platform id, or by name while the stored signature is still NULL.
+        if legacy_conditions:
+            rows = self.session.scalars(
+                select(CandidateSource).where(
+                    CandidateSource.company_id == page.company_id,
+                    CandidateSource.platform == payload["platform"],
+                    CandidateSource.platform_account_id == page.account.id,
+                    or_(*legacy_conditions),
+                )
+            ).all()
+            source = next((row for row in rows if JobNameNormalizer().normalize(_canonical_job_name(row.raw_job_name)) == canonical_job), None)
+            if source:
+                source.source_identity_key = identity
+                return source
+        # BOSS renders the profile card inconsistently between scans, so the
+        # derived identity signature changes for the same person (e.g. the card
+        # is still hydrating and age/education are missing). Reuse the existing
+        # name+job row for this recruiter instead of creating a second row —
+        # clicking an unread candidate and then messaging them must stay one
+        # row, not two.
+        #
+        # Reuse is limited to neighbours that cannot be a different person:
+        # an exact signature match, or one side with no signature at all
+        # (incomplete card). Two different complete signatures stay separate so
+        # the same-name cohort test keeps holding.
         candidates = self.session.scalars(
             select(CandidateSource).where(
                 CandidateSource.company_id == page.company_id,
@@ -904,15 +1218,47 @@ class RecruitmentCollaborationService:
                 CandidateSource.candidate_normalized_name == normalized_name,
             )
         ).all()
+        same_job = [
+            row
+            for row in candidates
+            if JobNameNormalizer().normalize(_canonical_job_name(row.raw_job_name)) == canonical_job
+        ]
         source = next(
             (
                 row
-                for row in candidates
-                if JobNameNormalizer().normalize(row.raw_job_name) == context.normalized_job
-                and (not signature or not row.candidate_identity_signature)
+                for row in same_job
+                # This scan could not read a full identity (card still
+                # hydrating): the name+job row is the best available match.
+                if not signature
+                # This scan did read one: only an identical signature is safe.
+                or row.candidate_identity_signature == signature
             ),
             None,
         )
+        if source is None and signature:
+            # Both sides are complete but differ. Merge only when the known
+            # demographics do not contradict each other, including the common
+            # case where one card lost a field while another gained it.
+            incoming = {
+                "age": payload.get("candidate_age"),
+                "experience": payload.get("candidate_experience"),
+                "education": payload.get("candidate_education"),
+            }
+            source = next(
+                (
+                    row
+                    for row in same_job
+                    if not _profile_conflicts(
+                        incoming,
+                        {
+                            "age": row.candidate_age,
+                            "experience": row.candidate_experience,
+                            "education": row.candidate_education,
+                        },
+                    )
+                ),
+                None,
+            )
         if source:
             source.source_identity_key = identity
         return source
@@ -1141,8 +1487,13 @@ class RecruitmentCollaborationService:
             .where(
                 CandidateSource.company_id == company_id,
                 CandidateSource.id != source.id,
-                Recruiter.id != actor_id,
                 CandidateSource.id.not_in(excluded_ids or {""}),
+                # First identify the same person by the four profile fields;
+                # only cross-account or cross-job observations are actionable.
+                or_(
+                    CandidateSource.platform_account_id != source.platform_account_id,
+                    CandidateSource.job_id != source.job_id,
+                ),
                 or_(
                     CandidateSource.candidate_normalized_name == source.candidate_normalized_name,
                     and_(CandidateSource.platform_candidate_id.is_not(None), CandidateSource.platform_candidate_id == source.platform_candidate_id),
@@ -1169,17 +1520,19 @@ class RecruitmentCollaborationService:
             ):
                 level, reason = MatchLevel.CONFIRMED_PLATFORM_ID.value, "已验证的平台候选人 ID 一致"
             elif source.candidate_identity_signature and source.candidate_identity_signature == other.candidate_identity_signature:
-                level, reason = "EXACT_IDENTITY", "姓名、年龄、工作年限、学历完全一致"
-            elif (source.job_id is not None and source.job_id == other.job_id) or (
-                source.job_id is None
-                and other.job_id is None
-                and JobNameNormalizer().normalize(source.raw_job_name) == JobNameNormalizer().normalize(other.raw_job_name)
-            ):
-                level, reason = MatchLevel.SUSPECTED_SAME_NAME_JOB.value, "标准化姓名和内部岗位一致"
-            elif other_job and other_job.category == category:
-                level, reason = MatchLevel.POSSIBLE_SAME_NAME_CATEGORY.value, "标准化姓名和岗位类别一致"
+                level = "EXACT_IDENTITY"
+                account_diff = source.platform_account_id != other.platform_account_id
+                job_diff = source.job_id != other.job_id or (
+                    source.job_id is None and other.job_id is None and
+                    JobNameNormalizer().normalize(_canonical_job_name(source.raw_job_name)) !=
+                    JobNameNormalizer().normalize(_canonical_job_name(other.raw_job_name))
+                )
+                reason = "姓名、年龄、工作年限、学历一致；BOSS账号不同" if account_diff and not job_diff else (
+                    "姓名、年龄、工作年限、学历一致；沟通岗位不同" if job_diff and not account_diff else
+                    "姓名、年龄、工作年限、学历一致；BOSS账号和沟通岗位均不同"
+                )
             else:
-                level, reason = MatchLevel.HISTORICAL_SAME_NAME.value, "仅标准化姓名一致"
+                continue
             event_types = event_types_by_owner[(other.id, recruiter.id)]
             stage = engagement.stage if engagement else other.recruitment_status
             interviewed = any(value in {"INTERVIEW_INVITED", "INTERVIEW_COMPLETED"} for value in event_types) or stage in {

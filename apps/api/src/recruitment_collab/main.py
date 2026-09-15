@@ -9,6 +9,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 
 from recruitment_collab.api.company_daily_routes import router as company_daily_router
+from recruitment_collab.api.realtime_routes import router as realtime_router
 from recruitment_collab.api.routes import router
 from recruitment_collab.application.collaboration import ApplicationError
 from recruitment_collab.config.settings import get_settings
@@ -56,4 +57,5 @@ async def application_error(request: Request, exc: ApplicationError):
 
 
 app.include_router(router)
+app.include_router(realtime_router)
 app.include_router(company_daily_router)
