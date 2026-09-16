@@ -52,6 +52,19 @@ def message_sent(client, headers, payload, sent_at="2026-09-02T01:00:00Z"):
     return client.post("/api/v1/plugin/engagements/message-sent", headers=headers, json={**payload, "sent_at": sent_at})
 
 
+def conversation_sync(client, headers, payload, sent_at="2026-09-02T01:00:00Z", has_recruiter_outbound=True):
+    """Seed a candidate row the way the click-sync and the history pass do.
+
+    Since sends stopped writing rows, every test that needs an existing
+    candidate record seeds it through the sync endpoint instead.
+    """
+    return client.post(
+        "/api/v1/plugin/conversations/sync",
+        headers=headers,
+        json={**payload, "sent_at": sent_at, "has_recruiter_outbound": has_recruiter_outbound},
+    )
+
+
 def test_opening_candidate_checks_without_creating_records(client, session):
     headers = login(client, "xie@example.com")
     response = client.post("/api/v1/plugin/context/check", headers=headers, json=context("小明", "谢女士", "xie"))
@@ -187,7 +200,7 @@ def test_boss_native_history_is_confirmed_without_creating_a_feishu_row(client, 
 
 
 def test_boss_native_history_enriches_matching_system_history_without_duplication(client):
-    assert message_sent(client, {}, context("振理", "王文懋", "native-feishu")).status_code == 200
+    assert conversation_sync(client, {}, context("振理", "王文懋", "native-feishu")).status_code == 200
     payload = context("振理", "成珈莉", "native-feishu-check")
     payload["native_communications"] = [
         {"recruiter_name": "王文懋", "job_name": "短视频编导", "contacted_at": "2026-08-05T18:27:00+08:00", "source": "BOSS_NATIVE"}
@@ -202,7 +215,7 @@ def test_boss_native_history_enriches_matching_system_history_without_duplicatio
 
 
 def test_incomplete_four_field_identity_does_not_match_by_name_or_job(client, session):
-    first = message_sent(client, {}, context("同名候选人", "谢女士", "first"))
+    first = conversation_sync(client, {}, context("同名候选人", "谢女士", "first"))
     assert first.status_code == 200
     incomplete = context("同名候选人", "珈莉", "second")
     incomplete["candidate_education"] = None
@@ -231,79 +244,6 @@ def test_transient_missing_profile_fields_do_not_erase_existing_candidate_data(c
     assert (source.candidate_age, source.candidate_experience, source.candidate_education) == (28, "6年", "本科")
 
 
-def test_confirmed_invitation_with_a_resolved_schedule_creates_one_interview(client, session):
-    headers = login(client, "xie@example.com")
-    invited = {
-        **context("约面候选人", "谢女士", "interview-scheduled"),
-        "recruitment_status": "已约面",
-        "status_evidence": "BOSS_INTERVIEW_INVITE",
-        "status_rule_version": "boss-status-v6",
-        "interview": {
-            "interview_type": "OFFLINE",
-            "scheduled_at": "2026-09-12T14:00:00+08:00",
-            "location": "无锡梁溪区世金中心39层",
-        },
-    }
-    assert message_sent(client, headers, invited).status_code == 200
-    rows = session.scalars(select(Interview)).all()
-    assert len(rows) == 1
-    assert rows[0].location_type == "OFFLINE"
-    assert rows[0].location_text == "无锡梁溪区世金中心39层"
-    assert rows[0].status == "SCHEDULED"
-
-    # A repeated send for the same candidate updates the same interview rather
-    # than stacking a duplicate calendar entry.
-    repeat = {
-        **invited,
-        "client_event_id": str(uuid.uuid4()),
-        "interview": {**invited["interview"], "location": "线上会议室"},
-    }
-    assert message_sent(client, headers, repeat).status_code == 200
-    session.expire_all()
-    rows = session.scalars(select(Interview)).all()
-    assert len(rows) == 1
-    assert rows[0].location_text == "线上会议室"
-
-
-def test_unreadable_interview_details_never_block_the_invitation(client, session):
-    headers = login(client, "xie@example.com")
-    invited = {
-        **context("日期不可读候选人", "谢女士", "interview-garbled"),
-        "recruitment_status": "已约面",
-        "status_evidence": "BOSS_INTERVIEW_INVITE",
-        # A scheduler the plugin could not read, plus deliberately malformed
-        # values: none of these may reject the invitation itself.
-        "interview": {
-            "interview_type": "VIDEO",
-            "scheduled_at": "not-a-date",
-            "location": "x" * 500,
-        },
-    }
-    assert message_sent(client, headers, invited).status_code == 200
-    source = session.scalar(
-        select(CandidateSource).where(
-            CandidateSource.candidate_display_name == "日期不可读候选人"
-        )
-    )
-    assert source is not None
-    assert source.recruitment_status == "已约面"
-    assert source.status_evidence == "BOSS_INTERVIEW_INVITE"
-    # The unreadable schedule is dropped, not turned into a fake calendar entry.
-    assert session.scalars(select(Interview)).all() == []
-
-
-def test_invitation_without_a_resolved_schedule_creates_no_interview(client, session):
-    headers = login(client, "xie@example.com")
-    invited = {
-        **context("未排期候选人", "谢女士", "interview-unresolved"),
-        "recruitment_status": "已约面",
-        "status_evidence": "BOSS_INTERVIEW_INVITE",
-        "interview": {"interview_type": "OFFLINE", "location": "无锡梁溪区世金中心39层"},
-    }
-    assert message_sent(client, headers, invited).status_code == 200
-    assert session.scalars(select(Interview)).all() == []
-
-
 def test_click_exact_identity_warns_latest_recruiter_with_cooldown(client, session):
     xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
     recruiters = session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all()
@@ -311,7 +251,7 @@ def test_click_exact_identity_warns_latest_recruiter_with_cooldown(client, sessi
         recruiter.feishu_open_id = f"open-{recruiter.id}"
     session.commit()
     xie_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
-    assert message_sent(client, xie, context("立即提醒候选人", "谢女士", "lookup-first")).status_code == 200
+    assert conversation_sync(client, xie, context("立即提醒候选人", "谢女士", "lookup-first")).status_code == 200
     payload = context("立即提醒候选人", "珈莉", "lookup-second")
     first = client.post("/api/v1/plugin/context/check", headers=jiali, json=payload)
     assert first.status_code == 200
@@ -401,7 +341,7 @@ def test_system_reset_keeps_all_administrators_and_clears_operational_rows(clien
     )
     session.add(second_admin)
     session.commit()
-    source_id = message_sent(client, login(client, "xie@example.com"), context("重置候选人", "谢女士", "reset-source")).json()["candidate_source_id"]
+    source_id = conversation_sync(client, login(client, "xie@example.com"), context("重置候选人", "谢女士", "reset-source")).json()["candidate_source_id"]
     preview = client.get("/api/v1/admin/system-reset/preview", headers=login(client, "admin@example.com"))
     assert preview.status_code == 200, preview.text
     data = preview.json()
@@ -420,8 +360,8 @@ def test_system_reset_keeps_all_administrators_and_clears_operational_rows(clien
 
 
 def test_recruiter_admin_lists_are_scoped_to_their_own_account(client):
-    assert message_sent(client, login(client, "xie@example.com"), context("本人候选人", "谢女士", "scope-xie")).status_code == 200
-    assert message_sent(client, login(client, "jiali@example.com"), context("他人候选人", "珈莉", "scope-jiali")).status_code == 200
+    assert conversation_sync(client, login(client, "xie@example.com"), context("本人候选人", "谢女士", "scope-xie")).status_code == 200
+    assert conversation_sync(client, login(client, "jiali@example.com"), context("他人候选人", "珈莉", "scope-jiali")).status_code == 200
     response = client.get("/api/v1/admin/candidate-sources", headers=login(client, "xie@example.com"))
     assert response.status_code == 200
     assert [row["candidate_display_name"] for row in response.json()] == ["本人候选人"]
@@ -434,7 +374,7 @@ def test_click_evidence_upgrade_bypasses_cooldown(client, session):
         recruiter.feishu_open_id = f"open-{recruiter.id}"
     session.commit()
     first_payload = context("升级证据候选人", "谢女士", "upgrade-first")
-    source_id = message_sent(client, xie, first_payload).json()["candidate_source_id"]
+    source_id = conversation_sync(client, xie, first_payload).json()["candidate_source_id"]
     current_payload = context("升级证据候选人", "珈莉", "upgrade-second")
     current_payload["candidate_age"] = 31
     suspected = client.post("/api/v1/plugin/context/check", headers=jiali, json=current_payload)
@@ -537,14 +477,18 @@ def test_duplicate_lookup_targets_previous_recruiter_when_their_activity_is_newe
     assert recipients == {colleague.id}
 
 
-def test_a_real_message_still_notifies_both_recruiters_about_the_conflict(client, session):
-    """Only the browse warning is viewer-only; a genuine conflict stays bilateral."""
+def test_a_newly_synced_row_still_notifies_both_recruiters_about_the_conflict(client, session):
+    """Only the browse warning is viewer-only; a genuine conflict stays bilateral.
+
+    Rows are created by the sync paths, so the persistent conflict and its
+    bilateral notifications now fire when the second row is synced.
+    """
     xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
     for recruiter in session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all():
         recruiter.feishu_open_id = f"open-{recruiter.id}"
     session.commit()
-    assert message_sent(client, xie, context("冲突提醒候选人", "谢女士", "conflict-first")).status_code == 200
-    assert message_sent(client, jiali, context("冲突提醒候选人", "珈莉", "conflict-second")).status_code == 200
+    assert conversation_sync(client, xie, context("冲突提醒候选人", "谢女士", "conflict-first")).status_code == 200
+    assert conversation_sync(client, jiali, context("冲突提醒候选人", "珈莉", "conflict-second")).status_code == 200
     conflict = session.scalar(select(Conflict))
     assert conflict is not None
     recipients = set(
@@ -561,13 +505,15 @@ def test_same_recruiter_same_name_and_job_with_different_age_stays_separate(clie
     first = context("同名候选人", "谢女士", "first")
     second = context("同名候选人", "谢女士", "second")
     second["candidate_age"] = 31
-    assert message_sent(client, {}, first).status_code == 200
-    assert message_sent(client, {}, second).status_code == 200
+    assert conversation_sync(client, {}, first).status_code == 200
+    # A genuinely different person may share the name and job; a later
+    # observation of them still creates their own row.
+    assert conversation_sync(client, {}, second, "2026-09-02T02:00:00Z").status_code == 200
     assert session.scalar(select(func.count()).select_from(CandidateSource)) == 2
 
 
 def test_snapshot_upload_keeps_only_tokens_and_requeues_candidate(client, session):
-    source_id = message_sent(client, {}, context("快照候选人", "谢女士", "snapshot")).json()["candidate_source_id"]
+    source_id = conversation_sync(client, {}, context("快照候选人", "谢女士", "snapshot")).json()["candidate_source_id"]
     image = b"\xff\xd8fake-jpeg\xff\xd9"
     response = client.post(
         f"/api/v1/plugin/conversations/{source_id}/snapshot",
@@ -582,7 +528,7 @@ def test_snapshot_upload_keeps_only_tokens_and_requeues_candidate(client, sessio
 
 
 def test_snapshot_upload_rejects_another_recruiters_source_before_upload(client, session):
-    source_id = message_sent(client, login(client, "xie@example.com"), context("归属候选人", "谢女士", "owner")).json()["candidate_source_id"]
+    source_id = conversation_sync(client, login(client, "xie@example.com"), context("归属候选人", "谢女士", "owner")).json()["candidate_source_id"]
     image = b"\xff\xd8fake-jpeg\xff\xd9"
     response = client.post(
         f"/api/v1/plugin/conversations/{source_id}/snapshot",
@@ -595,7 +541,7 @@ def test_snapshot_upload_rejects_another_recruiters_source_before_upload(client,
 
 
 def test_resume_preview_upload_keeps_only_feishu_metadata(client, session):
-    source_id = message_sent(client, {}, context("简历候选人", "谢女士", "resume")).json()["candidate_source_id"]
+    source_id = conversation_sync(client, {}, context("简历候选人", "谢女士", "resume")).json()["candidate_source_id"]
     resume = b"%PDF-1.7\nminimal-test-resume"
     response = client.post(
         f"/api/v1/plugin/conversations/{source_id}/resume",
@@ -629,7 +575,7 @@ def test_resume_preview_upload_keeps_only_feishu_metadata(client, session):
     ],
 )
 def test_resume_preview_accepts_supported_formats(client, session, file_name, content_type, content):
-    source_id = message_sent(client, {}, context(f"格式候选人-{file_name}", "谢女士", file_name)).json()["candidate_source_id"]
+    source_id = conversation_sync(client, {}, context(f"格式候选人-{file_name}", "谢女士", file_name)).json()["candidate_source_id"]
     response = client.post(
         f"/api/v1/plugin/conversations/{source_id}/resume",
         data={"resume_hash": hashlib.sha256(content).hexdigest(), "related_source_ids": ""},
@@ -681,7 +627,7 @@ def test_scan_report_rejects_a_future_pass_time(client):
 
 def test_unmapped_recruitment_account_does_not_block_candidate_flow(client):
     headers = login(client, "xie@example.com")
-    response = message_sent(client, headers, context("小明", "无需绑定的页面账号", "unmapped-account"))
+    response = conversation_sync(client, headers, context("小明", "无需绑定的页面账号", "unmapped-account"))
     assert response.status_code == 200
     data = response.json()
     assert data["result_type"] == "NO_HISTORY"
@@ -700,7 +646,7 @@ def test_unmapped_job_still_records_sent_message_and_raw_boss_job(client, sessio
     headers = login(client, "xie@example.com")
     payload = context("未映射岗位候选人", "谢女士", "unmapped-job")
     payload["job_display_name"] = "全新 BOSS 岗位"
-    response = message_sent(client, headers, payload)
+    response = conversation_sync(client, headers, payload)
     assert response.status_code == 200
     data = response.json()
     assert data["candidate_source_id"]
@@ -710,14 +656,15 @@ def test_unmapped_job_still_records_sent_message_and_raw_boss_job(client, sessio
     assert data["feishu_candidate_fields"]["BOSS岗位"] == "全新 BOSS 岗位"
     assert data["feishu_candidate_fields"]["标准岗位"] == ""
     assert session.scalar(select(func.count()).select_from(CandidateSource)) == 1
-    assert session.scalar(select(func.count()).select_from(RecruitmentEvent)) == 1
+    # The sync paths own row creation and do not log MESSAGE_SENT events.
+    assert session.scalar(select(func.count()).select_from(RecruitmentEvent)) == 0
     assert session.scalar(select(func.count()).select_from(CandidateSyncOutbox)) == 1
 
 
 def test_mapping_an_unmapped_job_backfills_existing_business_rows(client, session):
     payload = context("回填岗位候选人", "谢女士", "backfill")
     payload["job_display_name"] = "待回填岗位"
-    source_id = message_sent(client, login(client, "xie@example.com"), payload).json()["candidate_source_id"]
+    source_id = conversation_sync(client, login(client, "xie@example.com"), payload).json()["candidate_source_id"]
     unmapped = session.scalar(select(UnmappedJob).where(UnmappedJob.normalized_job_name == "待回填岗位"))
     job = session.scalar(select(RecruitmentJob))
     response = client.patch(f"/api/v1/admin/unmapped-jobs/{unmapped.id}", headers=login(client, "admin@example.com"), json={"job_id": job.id})
@@ -726,8 +673,8 @@ def test_mapping_an_unmapped_job_backfills_existing_business_rows(client, sessio
     session.expire_all()
     source = session.get(CandidateSource, source_id)
     assert source.job_id == job.id
-    assert session.scalar(select(Engagement).where(Engagement.candidate_source_id == source_id)).job_id == job.id
-    assert session.scalar(select(RecruitmentEvent).where(RecruitmentEvent.candidate_source_id == source_id)).job_id == job.id
+    assert session.scalar(select(Engagement).where(Engagement.candidate_source_id == source_id)) is None
+    assert session.scalar(select(RecruitmentEvent).where(RecruitmentEvent.candidate_source_id == source_id)) is None
     assert (
         session.scalar(select(CandidateSyncOutbox).where(CandidateSyncOutbox.candidate_source_id == source_id)).payload_json["标准岗位"] == job.canonical_name
     )
@@ -745,8 +692,8 @@ def test_same_platform_candidate_on_two_jobs_creates_two_rows(client, session):
     first["platform_candidate_id"] = "pid-one"
     second = context("平台候选人", "谢女士", "platform-job-2")
     second.update({"platform_candidate_id": "pid-one", "job_display_name": "第二岗位"})
-    first_id = message_sent(client, headers, first).json()["candidate_source_id"]
-    second_id = message_sent(client, headers, second).json()["candidate_source_id"]
+    first_id = conversation_sync(client, headers, first).json()["candidate_source_id"]
+    second_id = conversation_sync(client, headers, second).json()["candidate_source_id"]
     assert first_id != second_id
     assert session.scalar(select(func.count()).select_from(CandidateSource)) == 2
 
@@ -754,27 +701,27 @@ def test_same_platform_candidate_on_two_jobs_creates_two_rows(client, session):
 def test_status_only_advances_on_stronger_explicit_evidence(client, session):
     headers = login(client, "xie@example.com")
     payload = context("状态候选人", "谢女士", "status")
-    first = message_sent(client, headers, {**payload, "recruitment_status": "已约面", "status_evidence": "BOSS_INTERVIEW_MARKER"})
+    first = conversation_sync(client, headers, {**payload, "recruitment_status": "已约面", "status_evidence": "BOSS_INTERVIEW_MARKER"})
     assert first.status_code == 200
     payload["client_event_id"] = str(uuid.uuid4())
-    lower = message_sent(client, headers, {**payload, "recruitment_status": "已获取简历", "status_evidence": "BOSS_RESUME_MARKER"})
+    lower = conversation_sync(client, headers, {**payload, "recruitment_status": "已获取简历", "status_evidence": "BOSS_RESUME_MARKER"}, "2026-09-02T02:00:00Z")
     assert lower.status_code == 200
     source = session.get(CandidateSource, first.json()["candidate_source_id"])
     assert source.recruitment_status == "已约面"
     payload["client_event_id"] = str(uuid.uuid4())
-    terminal = message_sent(client, headers, {**payload, "recruitment_status": "已拒绝", "status_evidence": "EXPLICIT_REJECTION"})
+    terminal = conversation_sync(client, headers, {**payload, "recruitment_status": "已拒绝", "status_evidence": "EXPLICIT_REJECTION"}, "2026-09-02T03:00:00Z")
     assert terminal.status_code == 200
     payload["client_event_id"] = str(uuid.uuid4())
-    assert message_sent(client, headers, {**payload, "recruitment_status": "沟通中", "status_evidence": "RECRUITER_OUTBOUND"}).status_code == 200
+    assert conversation_sync(client, headers, {**payload, "recruitment_status": "沟通中", "status_evidence": "RECRUITER_OUTBOUND"}, "2026-09-02T04:00:00Z").status_code == 200
     assert session.get(CandidateSource, first.json()["candidate_source_id"]).recruitment_status == "已拒绝"
 
 
 def test_newer_recontact_intent_reopens_existing_candidate(client, session):
     headers = login(client, "xie@example.com")
     payload = context("重新沟通候选人", "谢女士", "recontact")
-    first = message_sent(client, headers, {**payload, "recruitment_status": "已拒绝", "status_evidence": "EXPLICIT_REJECTION"})
+    first = conversation_sync(client, headers, {**payload, "recruitment_status": "已拒绝", "status_evidence": "EXPLICIT_REJECTION"})
     assert first.status_code == 200
-    second = message_sent(client, headers, {
+    second = conversation_sync(client, headers, {
         **payload, "client_event_id": str(uuid.uuid4()),
         "recruitment_status": "待约面", "status_evidence": "RECRUITER_RECONTACT_INTENT",
     }, "2026-09-07T01:00:00Z")
@@ -783,15 +730,12 @@ def test_newer_recontact_intent_reopens_existing_candidate(client, session):
     source = session.get(CandidateSource, first.json()["candidate_source_id"])
     assert source.recruitment_status == "待约面"
     assert source.conversation_updated_at.day == 7
-    assert session.scalar(select(func.count()).select_from(RecruitmentEvent).where(
-        RecruitmentEvent.candidate_source_id == source.id, RecruitmentEvent.event_type == "MESSAGE_SENT",
-    )) == 2
 
 
 def test_v3_neutral_evidence_repairs_a_legacy_false_rejection(client, session):
     headers = login(client, "xie@example.com")
     payload = context("旧误拒绝候选人", "谢女士", "legacy-rejection")
-    first = message_sent(
+    first = conversation_sync(
         client,
         headers,
         {
@@ -803,7 +747,7 @@ def test_v3_neutral_evidence_repairs_a_legacy_false_rejection(client, session):
     )
     source_id = first.json()["candidate_source_id"]
     payload["client_event_id"] = str(uuid.uuid4())
-    repaired = message_sent(
+    repaired = conversation_sync(
         client,
         headers,
         {
@@ -821,7 +765,7 @@ def test_v3_neutral_evidence_repairs_a_legacy_false_rejection(client, session):
 
 
 def test_snapshot_failure_status_does_not_replace_ready_attachment(client, session):
-    source_id = message_sent(client, {}, context("快照状态候选人", "谢女士", "snapshot-status")).json()["candidate_source_id"]
+    source_id = conversation_sync(client, {}, context("快照状态候选人", "谢女士", "snapshot-status")).json()["candidate_source_id"]
     failed = client.put(
         "/api/v1/plugin/conversations/snapshot-status",
         json={"candidate_source_ids": [source_id], "status": "FAILED", "error_code": "SNAPSHOT_EMPTY"},
@@ -846,9 +790,9 @@ def test_reopening_same_boss_candidate_updates_one_source_record(client, session
     payload = context("王照亭", "李先生", "boss-chat")
     payload["platform"] = "boss"
     payload["page_url"] = "https://www.zhipin.com/web/chat/index"
-    first = message_sent(client, headers, payload).json()
+    first = conversation_sync(client, headers, payload).json()
     payload["client_event_id"] = str(uuid.uuid4())
-    second = message_sent(client, headers, payload, "2026-09-02T02:00:00Z").json()
+    second = conversation_sync(client, headers, payload, "2026-09-02T02:00:00Z").json()
     assert second["candidate_source_id"] == first["candidate_source_id"]
     assert session.scalar(select(func.count()).select_from(CandidateSource)) == 1
     assert second["feishu_candidate_fields"]["BOSS账号"] == "李先生"
@@ -863,7 +807,7 @@ def test_plugin_context_does_not_require_internal_login_token(client, session):
     checked = client.post("/api/v1/plugin/context/check", json=payload)
     assert checked.status_code == 200
     assert session.scalar(select(func.count()).select_from(CandidateSource)) == 0
-    sent = message_sent(client, {}, payload)
+    sent = conversation_sync(client, {}, payload)
     assert sent.status_code == 200
     assert sent.json()["feishu_candidate_fields"]["BOSS账号"] == "李先生"
     assert session.scalar(select(func.count()).select_from(CandidateSyncOutbox)) == 1
@@ -905,36 +849,17 @@ def test_production_plugin_endpoints_require_an_active_feishu_device(client, ses
 def test_message_sent_is_idempotent_and_does_not_duplicate_business_events(client, session):
     headers = login(client, "xie@example.com")
     payload = context("幂等候选人", "谢女士", "idempotent")
+    # Rows are owned by the sync paths; a send attaches its audit event to an
+    # existing row and a retried send stays idempotent.
+    source_id = conversation_sync(client, headers, payload).json()["candidate_source_id"]
     first = message_sent(client, headers, payload)
     repeat = message_sent(client, headers, payload)
     assert first.status_code == repeat.status_code == 200
     assert repeat.json()["idempotent"] is True
-    assert repeat.json()["candidate_source_id"] == first.json()["candidate_source_id"]
+    assert repeat.json()["candidate_source_id"] == source_id
     assert session.scalar(select(func.count()).select_from(CandidateSource)) == 1
     assert session.scalar(select(func.count()).select_from(RecruitmentEvent)) == 1
     assert session.scalar(select(func.count()).select_from(CandidateSyncOutbox)) == 1
-
-
-def test_idempotent_retry_requests_snapshot_when_previous_capture_failed(client, session):
-    headers = login(client, "xie@example.com")
-    payload = {
-        **context("截图重试候选人", "谢女士", "snapshot-retry"),
-        "recruitment_status": "沟通中",
-        "status_evidence": "RECRUITER_OUTBOUND",
-        "status_rule_version": "boss-status-v4",
-    }
-    first = message_sent(client, headers, payload)
-    assert first.status_code == 200
-    source = session.get(CandidateSource, first.json()["candidate_source_id"])
-    assert source is not None
-    source.snapshot_status = "FAILED"
-    source.snapshot_tokens_json = []
-    session.commit()
-
-    repeat = message_sent(client, headers, payload)
-    assert repeat.status_code == 200
-    assert repeat.json()["idempotent"] is True
-    assert repeat.json()["snapshot_needed"] is True
 
 
 def test_snapshot_is_requested_only_by_the_history_sync(client, session):
@@ -978,6 +903,8 @@ def test_snapshot_is_requested_only_by_the_history_sync(client, session):
     assert history.status_code == 200
     assert history.json()["snapshot_needed"] is True
 
+    # An ordinary message only registers the event: the full chat capture
+    # scrolls the pane the recruiter is still typing in.
     chat = message_sent(
         client,
         headers,
@@ -988,37 +915,10 @@ def test_snapshot_is_requested_only_by_the_history_sync(client, session):
         },
     )
     assert chat.status_code == 200
-    # An ordinary message only registers the event: the full chat capture
-    # scrolls the pane the recruiter is still typing in.
     assert chat.json()["snapshot_needed"] is False
-
-    invite = message_sent(
-        client,
-        headers,
-        {
-            **context("邀约截图候选人", "谢女士", "invite-snapshot"),
-            "recruitment_status": "已约面",
-            "status_evidence": "BOSS_INTERVIEW_MARKER",
-            "status_rule_version": "boss-status-v4",
-            "interview": {
-                "interview_type": "ONLINE",
-                "scheduled_at": "2026-09-05T06:00:00Z",
-                "location": "线上视频面试",
-            },
-        },
-    )
-    assert invite.status_code == 200
-    # No send asks for a screenshot, the interview invitation included: the
-    # confirmation still records the interview row and the 已约面 status, while
-    # the chat long image stays the history pass's job.
-    assert invite.json()["snapshot_needed"] is False
-    assert session.get(CandidateSource, invite.json()["candidate_source_id"]).recruitment_status == "已约面"
-    assert session.scalar(
-        select(func.count()).select_from(Interview).where(Interview.candidate_source_id == invite.json()["candidate_source_id"])
-    ) == 1
-    assert session.scalar(
-        select(func.count()).select_from(Interview).where(Interview.candidate_source_id == invite.json()["candidate_source_id"])
-    ) == 1
+    # A send attaches to the synced row without creating a second one.
+    assert chat.json()["candidate_source_id"] == first.json()["candidate_source_id"]
+    assert session.scalar(select(func.count()).select_from(CandidateSource)) == 1
 
 
 def test_boss_non_chat_page_is_ignored(client, session):
@@ -1035,13 +935,13 @@ def test_conversation_times_keep_earliest_start_and_latest_update(client, sessio
     headers = login(client, "xie@example.com")
     payload = context("时间候选人", "谢女士", "conversation-times")
     payload.update({"conversation_started_at": "2026-09-02T01:00:00Z", "conversation_updated_at": "2026-09-02T02:00:00Z"})
-    first = message_sent(client, headers, payload, "2026-09-02T01:00:00Z")
+    first = conversation_sync(client, headers, payload, "2026-09-02T01:00:00Z")
     assert first.status_code == 200
     payload.update({"client_event_id": str(uuid.uuid4())})
-    second = message_sent(client, headers, payload, "2026-09-01T01:00:00Z")
+    second = conversation_sync(client, headers, payload, "2026-09-01T01:00:00Z")
     assert second.status_code == 200
     payload.update({"client_event_id": str(uuid.uuid4())})
-    third = message_sent(client, headers, payload, "2026-09-03T02:00:00Z")
+    third = conversation_sync(client, headers, payload, "2026-09-03T02:00:00Z")
     assert third.status_code == 200
     source = session.get(CandidateSource, second.json()["candidate_source_id"])
     assert source.conversation_started_at.isoformat() == "2026-09-01T01:00:00"
@@ -1056,11 +956,13 @@ def test_conversation_times_keep_earliest_start_and_latest_update(client, sessio
 
 def test_second_page_recruiter_creates_conflict_without_unmapped_direct_message(client, session):
     xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
-    first = message_sent(client, xie, context("小明", "谢女士", "xie")).json()
+    first = conversation_sync(client, xie, context("小明", "谢女士", "xie")).json()
     check = client.post("/api/v1/plugin/context/check", headers=jiali, json=context("小明", "珈莉", "jiali")).json()
     assert check["result_type"] == "CONFIRMED_DUPLICATE"
     assert session.scalar(select(func.count()).select_from(CandidateSource)) == 1
-    second = message_sent(client, jiali, context("小明", "珈莉", "jiali")).json()
+    # The row — and with it the persistent conflict — is created by the sync
+    # path, not by a send.
+    second = conversation_sync(client, jiali, context("小明", "珈莉", "jiali")).json()
     assert second["result_type"] == "CONFIRMED_DUPLICATE"
     assert second["history_summary"]["multiple_recruiters"] is True
     assert session.scalar(select(func.count()).select_from(CandidateSource)) == 2
@@ -1086,7 +988,7 @@ def test_second_page_recruiter_creates_conflict_without_unmapped_direct_message(
 
 def test_continue_requires_reason(client):
     headers = login(client, "xie@example.com")
-    source = message_sent(client, headers, context("张女士", "谢女士", "reason")).json()
+    source = conversation_sync(client, headers, context("张女士", "谢女士", "reason")).json()
     response = client.post(
         "/api/v1/plugin/events",
         headers=headers,
@@ -1270,7 +1172,7 @@ def test_reconcile_compares_calendar_only_rows_by_day(client, session):
 def test_message_bubble_time_is_not_rolled_back_by_a_later_scan(client, session):
     """更新时间 follows the sent bubble, not the list row."""
     headers = login(client, "xie@example.com")
-    source_id = message_sent(
+    source_id = conversation_sync(
         client, headers, context("气泡时间候选人", "谢女士", "bubble"),
         sent_at="2025-09-02T05:30:00Z",
     ).json()["candidate_source_id"]
@@ -1301,7 +1203,7 @@ def test_browse_alert_warns_latest_recruiter_and_reconciliation_is_silent(client
     session.commit()
     xie_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
     jiali_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "珈莉"))
-    assert message_sent(client, xie, context("浏览提醒候选人", "谢女士", "browse-first")).status_code == 200
+    assert conversation_sync(client, xie, context("浏览提醒候选人", "谢女士", "browse-first")).status_code == 200
 
     payload = context("浏览提醒候选人", "珈莉", "browse-second")
     opened = client.post("/api/v1/plugin/context/check", headers=jiali, json=payload)
@@ -1408,7 +1310,9 @@ def test_second_recruiter_who_really_comms_receives_the_lookup_card(client, sess
     xie_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
     jiali_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "珈莉"))
 
-    first = message_sent(client, xie, context("先后沟通候选人", "谢女士", "two-first"), sent_at="2026-09-15T10:00:00+08:00")
+    # The first recruiter's row comes from the sync path; only the second
+    # recruiter's actual send is a send.
+    first = conversation_sync(client, xie, context("先后沟通候选人", "谢女士", "two-first"), sent_at="2026-09-15T10:00:00+08:00")
     assert first.status_code == 200, first.text
     # Nobody else held the candidate yet, so the first communication is silent.
     assert session.scalar(select(func.count()).select_from(NotificationOutbox).where(NotificationOutbox.event_type == "DUPLICATE_LOOKUP")) == 0
@@ -1436,7 +1340,7 @@ def test_lookup_card_never_names_its_own_recipient(client, session):
         recruiter.feishu_open_id = f"open-{recruiter.id}"
     session.commit()
     xie_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
-    assert message_sent(client, xie, context("只浏览候选人", "谢女士", "browse-first"), sent_at="2026-09-15T10:00:00+08:00").status_code == 200
+    assert conversation_sync(client, xie, context("只浏览候选人", "谢女士", "browse-first"), sent_at="2026-09-15T10:00:00+08:00").status_code == 200
 
     opened = client.post("/api/v1/plugin/context/check", headers=jiali, json=context("只浏览候选人", "珈莉", "browse-second"))
     assert opened.status_code == 200, opened.text
@@ -1447,3 +1351,63 @@ def test_lookup_card_never_names_its_own_recipient(client, session):
     assert payload["recipient_is_viewer"] is False
     assert payload["matched_recruiter_name"] == "珈莉"
     assert "谢女士" not in payload["matched_recruiter_names"]
+
+
+def test_own_cross_job_record_is_flagged_as_own_history(client, session):
+    """A cross-job record of the viewer's own stays visible, but is worded as
+    their own history with the other job named — never as a colleague
+    conflict naming the viewer.
+    """
+    xie = login(client, "xie@example.com")
+    xie_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
+    first = conversation_sync(client, xie, context("重复跟进候选人", "谢女士", "own-job-one"), sent_at="2026-09-15T10:00:00+08:00")
+    assert first.status_code == 200, first.text
+    second_payload = context("重复跟进候选人", "谢女士", "own-job-two")
+    second_payload["job_display_name"] = "实习剪辑"
+    second = message_sent(client, xie, second_payload, sent_at="2026-09-16T10:30:00+08:00")
+    assert second.status_code == 200, second.text
+    body = second.json()
+    own = [item for item in body["matches"] if item.get("is_own_history")]
+    assert own and own[0]["recruiter_id"] == xie_recruiter.id
+    assert own[0]["job_name"] == "短视频编导"
+    assert body["ui"]["title"] == "你本人跟进过的候选人"
+    assert "你本人" in body["ui"]["message"]
+    assert "实习剪辑" not in body["ui"]["message"] or "短视频编导" in body["ui"]["message"]
+    assert f"{xie_recruiter.display_name} 已在跟进该候选人" not in body["ui"]["message"]
+
+
+def test_chat_text_glued_to_the_job_label_keeps_one_row(client, session):
+    """BOSS renders the first chat line in the same text run as the job title.
+
+    The polluted title used to be part of the candidate's identity key and of
+    the same-job comparison, so one candidate whose conversation kept moving
+    gained one row per distinct chat text (张雨庭 ×4).
+    """
+    headers = login(client, "xie@example.com")
+    listed = context("张雨庭", "谢女士", "job-glue-first")
+    listed["job_display_name"] = "AI短视频内容生成师"
+    source_id = conversation_sync(client, headers, listed).json()["candidate_source_id"]
+
+    for suffix, glue in (
+        ("job-glue-second", " BOSS您好,我具备岗位所需技能,且学习能力强,可以给您发简历看看吗? 10:33"),
+        ("job-glue-third", " BOSS您好,我具备岗位所需技能,且学习能力强,可以给您发简历看看吗? 你好啊,可以聊一聊~ 不好意思,不太合适哦 求简历 换电话 换"),
+    ):
+        polluted = context("张雨庭", "谢女士", suffix)
+        polluted["job_display_name"] = f"AI短视频内容生成师{glue}"
+        again = conversation_sync(client, headers, polluted, "2026-09-02T02:00:00Z")
+        assert again.status_code == 200, again.text
+        assert again.json()["candidate_source_id"] == source_id
+
+    assert session.scalar(select(func.count()).select_from(CandidateSource)) == 1
+
+
+def test_job_label_canonicalization_strips_page_and_chat_tails():
+    from recruitment_collab.application.collaboration import _canonical_job_name
+
+    assert _canonical_job_name("AI短视频内容生成师") == "AI短视频内容生成师"
+    assert _canonical_job_name("AI短视频内容生成师 BOSS您好,我具备岗位所需技能") == "AI短视频内容生成师"
+    assert _canonical_job_name("直播助播 您好,我想和您沟通下…") == "直播助播"
+    assert _canonical_job_name("财务主管 最近关注：无锡") == "财务主管"
+    assert _canonical_job_name("AI短视频内容生成师 10:33") == "AI短视频内容生成师"
+    # A title that contains nothing but the tail is kept rather than emptied.
+    assert _canonical_job_name("您好") == "您好"

@@ -78,6 +78,28 @@ const isName = (value: string) =>
   !isBossUiText(value.replace(/[ \t]+/g, "")) &&
   !BOSS_NON_NAME_TEXT.test(value.replace(/[ \t]+/g, "")) &&
   !/(本科|硕士|大专|活跃|昨天|今天|刚刚|全部|未读)/.test(value.replace(/[ \t]+/g, ""));
+// Account display names are BOSS-side nicknames, not real names: they carry
+// latin letters and digits ("Amy王", "招聘01") that the candidate rules reject, and
+// words such as 招聘/简历/微信 that a nickname may legitimately keep. Only the
+// conversational openers chat text is made of stay excluded, because the chip
+// anchors sit in page text where a chat line can follow them.
+const ACCOUNT_NAME = /^[\u4e00-\u9fff·A-Za-z0-9_-]{2,24}$/;
+const ACCOUNT_TITLED_NAME = /^[\u4e00-\u9fff·A-Za-z0-9_-]{1,24}\s*(?:先生|女士)$/;
+const ACCOUNT_NON_NAME_TEXT = /(?:您好|你好|请问|谢谢|感谢|好的.*感谢)|(?:吗|呢|呀|吧)[？?]?$/;
+// Whole-value labels that share the header text region with the account chip.
+// They are anchors for the page, never a person, and matching them exactly keeps
+// a real nickname that merely contains the same word unaffected.
+const BOSS_ACCOUNT_UI_TEXT =
+  /^(?:升级VIP|账号权益|切换账号|退出登录|个人中心|账号设置|消息通知|招聘数据|职位管理|候选人列表|互动|沟通|首页|消息|通讯录|我的|设置|刷新|BOSS直聘|直聘|BOSS|Boss|boss|智联招聘|猎聘|拉勾)$/;
+const isAccountName = (value: string) => {
+  const compact = value.replace(/[ \t]+/g, "");
+  return (
+    ACCOUNT_NAME.test(compact) &&
+    !isBossUiText(compact) &&
+    !BOSS_ACCOUNT_UI_TEXT.test(compact) &&
+    !ACCOUNT_NON_NAME_TEXT.test(compact)
+  );
+};
 const canonicalName = (value: string) =>
   value.replace(/[ \t]+(?=[\u4e00-\u9fff·])/g, "");
 // `26届` and `26年毕业` are graduation cohorts, not years of experience. The
@@ -112,7 +134,11 @@ const JOB_TRAILING_LABEL =
   /\s*(?:最近关注|最近登录|最近沟通|求职意向|期望|薪资|工作地点|到岗时间)\s*[：:][\s\S]*$/;
 const JOB_TRAILING_PLAIN = /\s*(?:最近关注|最近登录|已读|未读|送达)\s*[\s\S]*$/;
 const JOB_CHAT_TAIL =
-  /[，,。；;！!？?][\s\S]*$|\s+(?:您好|你好|请问|期待|方便|我们|目前|我是|有意向|在吗|看到)[\s\S]*$/;
+  // BOSS often prefixes the greeting with the account name (`AI短视频内容生成师
+  // BOSS您好,…`), so the marker must allow that word between the space and the
+  // greeting. Without it the title kept the glue and the server saw a different
+  // job each time the chat text changed, which created one row per message.
+  /\s*(?:BOSS|boss)\s*(?=您好|你好|请问|在吗)[\s\S]*$|\s+(?:您好|你好|请问|期待|方便|我们|目前|我是|有意向|在吗|看到)[\s\S]*$|\s+\d{1,2}:\d{2}[\s\S]*$|[，,。；;！!？?][\s\S]*$/;
 const JOB_PROFILE_TAIL = /\s+[\u4e00-\u9fff·]{2,20}\s+\d{1,2}\s*岁[\s\S]*$/;
 function cleanJobName(value: string) {
   return value
@@ -177,18 +203,18 @@ function accountName(text: string) {
   );
   if (marker >= 0)
     for (const value of values.slice(marker + 1, marker + 4))
-      if (isName(value)) return value;
+      if (isAccountName(value)) return value;
   const normalized = normalizeBossText(text);
   const labeled = normalized.match(
-    /(?:账号权益|升级VIP)\s*[|｜ ]+([\u4e00-\u9fff·]{1,20}(?:先生|女士))/,
+    /(?:账号权益|升级VIP)\s*[|｜ ]+([\u4e00-\u9fff·A-Za-z0-9_-]{1,24}(?:先生|女士))/,
   );
   if (labeled?.[1]) return labeled[1].trim();
   const bare = normalized.match(
-    /(?:账号权益|升级VIP)\s+([\u4e00-\u9fff·]{2,20})(?:\s|$)/,
+    /(?:账号权益|升级VIP)\s+([\u4e00-\u9fff·A-Za-z0-9_-]{2,24})(?:\s|$)/,
   )?.[1];
-  if (bare && isName(bare)) return bare;
+  if (bare && isAccountName(bare)) return bare;
   const top = values.slice(0, 240).find((value) =>
-    /^[\u4e00-\u9fff·]{1,20}\s*(?:先生|女士)$/.test(value),
+    ACCOUNT_TITLED_NAME.test(value),
   );
   if (top) return top.replace(/\s+(?=先生|女士)/, "");
   if (typeof document !== "undefined") {
@@ -196,7 +222,7 @@ function accountName(text: string) {
       '[class*="account" i], [class*="user" i], [class*="recruit" i], [class*="boss" i]',
     )].find((node) => {
       const text = normalizeBossText(node.innerText || node.textContent || "");
-      return /^[\u4e00-\u9fff·]{1,20}\s*(?:先生|女士)$/.test(text);
+      return ACCOUNT_TITLED_NAME.test(text);
     });
     if (accountNode)
       return normalizeBossText(accountNode.innerText || accountNode.textContent || "").replace(
@@ -210,10 +236,14 @@ function accountName(text: string) {
       .map((node) => ({ node, text: normalizeBossText(node.textContent || "") }))
       .filter(({ node, text }) => {
         const rect = node.getBoundingClientRect();
+        // Badges and icons sit inside the same header, so the value still has to
+        // look like an account nickname: the wider alphabet applies here too, or
+        // a nickname such as "Amy王" is unrecognisable in builds that render the
+        // header without the 账号权益 chip.
         const compact = text.replace(/[\s\u200b\ufeff]+/g, "");
         return (
           node.children.length <= 2 &&
-          /^[\u4e00-\u9fff·]{1,20}(?:先生|女士)?$/.test(compact) &&
+          isAccountName(compact) &&
           rect.top >= 0 &&
           rect.top < 260 &&
           rect.left > window.innerWidth * 0.55
@@ -232,7 +262,7 @@ function accountName(text: string) {
         return (
           node.children.length >= 2 &&
           compact.length <= 24 &&
-          /^[\u4e00-\u9fff]{1,20}(?:先生|女士)$/.test(compact) &&
+          ACCOUNT_TITLED_NAME.test(compact) &&
           rect.top >= 0 && rect.top < 260 && rect.left > window.innerWidth * 0.55
         );
       })

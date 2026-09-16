@@ -14,6 +14,7 @@ import {
   currentBossListFilter,
   decideBossRow,
   isBossListActivityNewer,
+  isWithinSweepScope,
   hasBossUnreadBadge,
   observeBossUnreadConversationClick,
   openBossCommunicatingFilter,
@@ -103,15 +104,6 @@ export function nextCatchupWindowDelayMs(now = Date.now()): number {
   return Math.max(1_000, Date.UTC(year, month - 1, day + (passed ? 1 : 0), CATCHUP_HOUR - 8, CATCHUP_MINUTE) - now);
 }
 
-/** The most recent 23:30 Asia/Shanghai sweep window that has already started. */
-export function lastCatchupWindowMs(now = Date.now()): number {
-  const { year, month, day, hour, minute } = shanghaiClock(now);
-  const passed = hour * 60 + minute >= CATCHUP_WINDOW_MINUTES;
-  // Before today's window the newest window is yesterday's. `Date.UTC`
-  // normalises day 0 into the previous month/year.
-  return Date.UTC(year, month - 1, day - (passed ? 0 : 1), CATCHUP_HOUR - 8, CATCHUP_MINUTE);
-}
-
 /**
  * A completed pass that never saw a single conversation row is not a success.
  *
@@ -127,72 +119,100 @@ export function isSuspiciousEmptyPass(
   return result.available && result.complete && traversed === 0;
 }
 
+/**
+ * The sweep's progress, kept per BOSS account in `chrome.storage.local`.
+ *
+ * Everything here is a calendar day, not a timestamp: BOSS renders day-level
+ * labels (`09月05日`) and a recruiter's "today" is the day they are working in,
+ * so an anchor that compared precise times could sweep yesterday's evening
+ * along with today or drop a row whose label carries no clock.
+ */
 export type CatchupHistoryState = {
   /** When the last sweep attempt started, completed or not. */
   last_attempt_at?: string;
   /** When a sweep actually finished a full pass. */
   last_completed_at?: string;
-  /** Newest conversation time already covered by a finished sweep. */
+  /** `YYYY-MM-DD` the last finished sweep covered. This is the anchor. */
+  swept_through_date?: string;
+  /** Legacy timestamp anchor, still read so an upgrade keeps its place. */
   swept_through_at?: string;
 };
 
+/** The most recent 23:30 Asia/Shanghai sweep window that has already started. */
+export function lastCatchupWindowMs(now = Date.now()): number {
+  const { year, month, day, hour, minute } = shanghaiClock(now);
+  const passed = hour * 60 + minute >= CATCHUP_WINDOW_MINUTES;
+  // Before tonight's window the newest one is yesterday's. `Date.UTC`
+  // normalises day 0 into the previous month/year.
+  return Date.UTC(year, month - 1, day - (passed ? 0 : 1), CATCHUP_HOUR - 8, CATCHUP_MINUTE);
+}
+
+/** A calendar day as a sortable number: 2026-09-16 becomes 20260916. */
+export function dateKey(value: Date | number): number {
+  const date = value instanceof Date ? value : new Date(value);
+  return date.getFullYear() * 10_000 + (date.getMonth() + 1) * 100 + date.getDate();
+}
+
+/** The `YYYY-MM-DD` form stored in the sweep state. */
+export function dateKeyString(key: number): string {
+  const year = Math.floor(key / 10_000);
+  const month = Math.floor(key / 100) % 100;
+  const day = key % 100;
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
 /**
- * The anchor handed to a sweep: only conversations newer than it are opened.
+ * The day a finished sweep covered, or null when the state carries none.
  *
- * A sweep must not walk the whole “沟通中” list every time. The anchor is the
- * newest list time a finished sweep already covered, so the next pass opens just
- * the conversations that moved since. A missing or unusable anchor returns ""
- * (no stop), and a parsed list time in the future is clamped to now so a single
- * bad label cannot lock every later sweep out.
+ * A stored day wins; installs that still carry only the older timestamp anchor
+ * (or a completion time) fall back to the day that value fell on.
  */
-export function sweepAnchor(state: CatchupHistoryState, now = Date.now()): string {
-  const stored = Date.parse(state.swept_through_at || "");
-  if (!Number.isFinite(stored) || stored > now) return "";
-  return new Date(stored).toISOString();
-}
-
-/** The 23:30 boundary that opens the cycle a sweep is responsible for. */
-export function sweepWindowStart(now = Date.now()): number {
-  // One minute back so a pass that fires at 23:30:0x covers the cycle that just
-  // ended instead of the one that just started.
-  return lastCatchupWindowMs(now - 60_000);
+export function coveredDateKey(state: CatchupHistoryState): number | null {
+  const stored = /^(\d{4})-(\d{2})-(\d{2})$/.exec((state.swept_through_date || "").trim());
+  if (stored) return Number(stored[1]) * 10_000 + Number(stored[2]) * 100 + Number(stored[3]);
+  const legacy = Date.parse(state.swept_through_at || "");
+  if (Number.isFinite(legacy)) return dateKey(legacy);
+  const completedAt = Date.parse(state.last_completed_at || "");
+  return Number.isFinite(completedAt) ? dateKey(completedAt) : null;
 }
 
 /**
- * Where a sweep starts reading the list.
+ * Where a sweep starts reading the list: the last day a finished sweep covered.
  *
- * "Today" is one 23:30 → 23:30 cycle, so a sweep covers the conversations that
- * moved inside it and nothing older: a multi-day backlog is not re-scanned, and
- * whatever a previous successful sweep already covered inside the same cycle is
- * skipped too. That is what keeps a sweep proportional to today's activity
- * instead of the size of the whole “沟通中” list.
+ * Today is the scope. A sweep opens the conversations whose list activity falls
+ * on a day the anchor does not already cover, so the normal case — yesterday's
+ * sweep finished — covers today alone, and a browser that was closed over a
+ * sweep day makes the next visit cover the missed days as well. A missing,
+ * unusable or future anchor starts at yesterday, so a fresh install covers today
+ * and never the whole conversation list.
  */
-export function sweepStartAnchor(state: CatchupHistoryState, now = Date.now()): string {
-  const covered = Date.parse(sweepAnchor(state, now) || "");
-  const anchor = Math.max(Number.isFinite(covered) ? covered : 0, sweepWindowStart(now));
-  return new Date(anchor).toISOString();
+export function sweepAnchorDay(state: CatchupHistoryState, now = Date.now()): number {
+  const today = dateKey(now);
+  const covered = coveredDateKey(state);
+  return covered === null || covered >= today ? dateKey(now - 86_400_000) : covered;
 }
 
 /**
- * The anchor to store after a finished sweep: the newest of the previous anchor
- * and the newest row this pass saw, never in the future.
+ * The anchor a finished sweep records: the last day that has ended.
  *
- * A finished pass has traversed every row down to the previous anchor, so
- * moving the anchor forward never skips a conversation that was not seen.
+ * A sweep only ever sees the day it runs in part-way through, so that day is not
+ * covered yet, and recording it is what made the next morning's pass skip the
+ * day that just ended. Recording yesterday instead means every pass covers the
+ * day that just ended plus the one in progress — a browser that was closed at
+ * 23:30 still gets yesterday, which is when the sweep actually runs in practice.
  */
-export function nextSweepAnchor(previous: string, observed: string, now = Date.now()): string {
-  const times = [Date.parse(previous), Date.parse(observed)].filter((value) => Number.isFinite(value));
-  if (!times.length) return "";
-  return new Date(Math.min(Math.max(...times), now)).toISOString();
+export function nextSweepAnchor(now = Date.now()): string {
+  return dateKeyString(dateKey(now - 86_400_000));
 }
 
 /**
- * True when the newest sweep window has no completed pass behind it.
+ * True when a sweep window passed without a completed pass behind it.
  *
- * Leaving the BOSS tab open is supposed to be enough: the daily sweep window is
- * 23:30, so a browser that was closed then used to wait for the next day with
- * nothing captured. The watermark makes the miss visible, and the next page
- * visit sweeps once the page is idle instead.
+ * Leaving the BOSS tab open is supposed to be enough: the sweep runs at 23:30,
+ * so a browser that was closed then used to wait for the next day with nothing
+ * captured. The miss is what the next page visit makes up, once the page is
+ * idle. This asks about windows, not days: the anchor deliberately trails a day
+ * behind, and treating that as "still owed" would re-sweep on every reload.
  */
 export function historyCatchupDueAt(state: CatchupHistoryState, now = Date.now()): boolean {
   const attemptedAt = Date.parse(state.last_attempt_at || "");
@@ -836,7 +856,7 @@ export class PageController {
     this.lastFingerprint = fields.fingerprint;
     const id = ++this.runId;
     if (this.development)
-      this.panel.showDevelopmentStatus("招聘消息已发送，正在登记跟进记录…");
+      this.panel.showDevelopmentStatus("招聘消息已发送，正在实时查重…");
     const extracted = this.payload(fields);
     const sentStatus = event.statusEvidence;
     const response = await this.send("MESSAGE_SENT", {
@@ -866,34 +886,25 @@ export class PageController {
     }
     const data = response.data as ContextResponse;
     if (!data.candidate_source_id) {
+      // No synced row yet: the send still did its job (real-time duplicate
+      // check), and the history pass will create the row with this
+      // conversation's times. Nothing to show for a production user.
       if (this.development)
         this.panel.showDevelopmentStatus(
-          `消息已发送但未登记：${data.ui.title}`,
+          "消息已发送；该候选人尚未同步，记录将由历史补扫建立",
         );
       else this.panel.hide();
       return;
     }
     this.showResult(data, "招聘消息已登记；未发现其他同事跟进");
-    // Screenshots are expensive: a full capture scrolls the recruiter's own
-    // conversation pane and is interrupted by the very typing that usually
-    // follows a message. A send itself never asks for one — the history pass
-    // captures every read conversation — so the server only answers `true` here
-    // for a row that still has no usable image at all.
-    const snapshotRequested = (response.data as { snapshot_needed?: boolean })
-      .snapshot_needed;
-    if (snapshotRequested) {
-      void this.uploadSnapshot([data.candidate_source_id], fields.fingerprint, {
-        candidateDisplayName: fields.candidateDisplayName,
-        platformCandidateId: fields.platformCandidateId,
-        jobDisplayName: fields.jobDisplayName,
-      });
-    }
     // The old checkpoint is intentionally retained when catch-up is
     // interrupted. Resume only after a quiet period; runBossCatchup's own
     // activity guard will pause again if the recruiter is still working.
+    // The interrupted pass resumes as the same kind — a sweep must not be
+    // refused by the page-open gate that only admits a missed window.
     this.catchupRestartTimer = window.setTimeout(() => {
       this.catchupRestartTimer = undefined;
-      void this.startCatchup().catch(() => this.scheduleCatchupRetry());
+      void this.startCatchup(this.retryHistorySnapshot).catch(() => this.scheduleCatchupRetry());
     }, 30_000);
   }
 
@@ -909,9 +920,10 @@ export class PageController {
     this.development =
       /^http:\/\/(localhost|127\.0\.0\.1)(?::\d+)?(?:\/|$)/.test(base);
     this.initialized = true;
-    // Run one initialization pass when the chat page becomes available. The
-    // pass itself still opens only read rows; subsequent unattended passes use
-    // the fixed 23:30 window rather than a ten-minute poll loop.
+    // No unattended pass runs merely because the page opened. This call only
+    // does something when the 23:30 sweep window was missed while the browser
+    // was closed; otherwise it returns immediately. The scheduled window and
+    // the popup's manual restart are the only other traversals.
     void this.startCatchup().catch(() => this.scheduleCatchupRetry());
     // Keep an open BOSS tab useful after phone-side conversations, but only
     // while it is actually visible: a background tab refreshes right before
@@ -937,8 +949,9 @@ export class PageController {
             const wasEnabled = this.catchupEnabled;
             this.catchupEnabled = enabled;
             // GET_AUTH is a local cache and can still contain yesterday's
-            // company switch.  When the live server setting enables catch-up,
-            // start the traversal now instead of waiting for another reload.
+            // company switch. When the live server setting enables catch-up,
+            // offer one pass now instead of waiting for a reload — it still
+            // only runs when the 23:30 window was missed.
             if (enabled && !wasEnabled)
               void this.startCatchup().catch(() => this.scheduleCatchupRetry());
           }
@@ -986,10 +999,9 @@ export class PageController {
     this.catchupRunning = true;
     this.retryHistorySnapshot = historySnapshot;
     this.catchupInterrupted = false;
-    // Catch-up is a short background pass. Keep the user informed in the
-    // same bottom-right surface used for duplicate results, and let the
-    // activity observer pause the pass as soon as they interact with BOSS.
-    this.panel.showCatchupStatus();
+    // The status card is raised only once this call is known to traverse, so a
+    // page open that has nothing to do stays completely silent. The activity
+    // observer then pauses the pass as soon as the recruiter touches BOSS.
     if (this.catchupRetryTimer !== undefined) {
       window.clearTimeout(this.catchupRetryTimer);
       this.catchupRetryTimer = undefined;
@@ -1024,17 +1036,25 @@ export class PageController {
     this.catchupUnreadState = new Map(Object.entries(persistedUnread));
     const hasWatermarkStore = typeof chrome !== "undefined" && !!chrome.storage?.local;
     const historyState = hasWatermarkStore ? await readCatchupHistory(historyStorageKey) : {};
-    // Only conversations that moved inside the current 23:30 cycle are opened,
-    // minus whatever an earlier sweep already covered in the same cycle. A sweep
-    // therefore costs today's activity, never the size of the whole list.
-    const anchor = sweepStartAnchor(historyState);
+    // Today is the scope: the anchor is the last day a finished sweep covered,
+    // so a sweep costs the conversations whose list activity falls on a day the
+    // anchor does not cover — today alone in the normal case, never the size of
+    // the whole list.
+    const anchorDay = sweepAnchorDay(historyState);
+    const anchor = dateKeyString(anchorDay);
     // Leaving the page open has to be enough. A sweep window that passed while
     // the browser was closed (or while the recruiter worked in another app)
     // would otherwise wait for the next 23:30 slot, so this visit upgrades
-    // itself to the history pass instead of the cheap reconcile — with exactly
-    // the same scope as the scheduled one: today's conversations only. Without a
-    // usable local watermark store it stays cheap.
-    if (!historySnapshot && pageOpenSweepDue(historyState, hasWatermarkStore)) {
+    // itself to the history pass — with exactly the same scope as the scheduled
+    // one: today's conversations only. Without a usable local watermark store
+    // the visit does nothing rather than sweeping blindly.
+    //
+    // Nothing else runs unattended: the light per-open reconcile was removed
+    // because it traversed the list on every page load and, being a re-read of
+    // rows the recruiter had already seen, only produced status noise. Only the
+    // 23:30 window, a manual restart, or this make-up pass traverse now.
+    if (!historySnapshot) {
+      if (!pageOpenSweepDue(historyState, hasWatermarkStore)) return;
       // Only sweep a page the recruiter is not using. Any typing, click or
       // scroll postpones it; scheduling a deferred attempt keeps the promise
       // that leaving the tab open is enough.
@@ -1048,6 +1068,9 @@ export class PageController {
     if (historySnapshot) {
       writeCatchupHistory(historyStorageKey, { last_attempt_at: new Date().toISOString() });
     }
+    // Past this point the pass really traverses: tell the recruiter, in the
+    // same bottom-right surface used for duplicate results.
+    this.panel.showCatchupStatus();
     // Polling is deliberately anchor-free: every pass walks the whole
     // “沟通中” list and prices each row against the stored table on its own.
     // An account-wide watermark is what previously let a row's newer time be
@@ -1098,6 +1121,13 @@ export class PageController {
     const shouldOpen = (rowText: string, activity: string) => {
       traversed += 1;
       unreadChanged(rowText);
+      // A sweep covers the days the anchor does not already cover. Rows from a
+      // covered day stay untouched even when they share a rendered batch with
+      // today's rows, which is how yesterday's conversations used to be swept.
+      if (historySnapshot && !isWithinSweepScope(activity, anchorDay)) {
+        this.pendingCatchupSyncReason = "CANDIDATE_OPENED";
+        return false;
+      }
       const decision = decideBossRow(rowText, activity, indexEntryFor(rowText), historySnapshot);
       if (decision.skip === "UNREAD") unreadSkipped += 1;
       if (!decision.open) {
@@ -1127,7 +1157,7 @@ export class PageController {
       this.scheduleCatchupRetry();
       return;
     }
-    let newestListActivity = "";
+
     const result = await runBossCatchup(
       anchor,
       originalCandidate,
@@ -1135,15 +1165,13 @@ export class PageController {
         const completed = await this.handleCatchupCandidate(rowText, activity);
         if (completed && !this.stopped)
           this.panel.showCatchupStatus(
-            `本轮已处理 ${matched} 个会话（范围：今天这个 23:30 周期）`,
+            `本轮已处理 ${matched} 个会话（范围：昨天和今天）`,
           );
         return completed;
       },
       shouldOpen,
-      ({ rowText, activity, hasUnread }) => {
+      ({ rowText, hasUnread }) => {
         observedUnread.set(unreadStateKey(rowText), hasUnread);
-        if (activity && (!newestListActivity || Date.parse(activity) > Date.parse(newestListActivity)))
-          newestListActivity = activity;
       },
       () => this.stopped || this.catchupInterrupted,
     );
@@ -1172,16 +1200,15 @@ export class PageController {
       this.catchupRetryAttempts = 0;
       passCompleted = true;
       if (historySnapshot) {
-        // Only a finished sweep satisfies the window and moves the anchor; an
-        // interrupted one is retried by the next visit (after the minimum gap).
-        // Advancing to the newest row the pass actually saw means the next sweep
-        // opens just what moved since.
-        const sweptThrough = nextSweepAnchor(sweepAnchor(historyState), newestListActivity);
+        // Only a finished sweep moves the anchor; an interrupted one is retried
+        // by the next visit (after the minimum gap). Its own day is covered
+        // whole, because a finished sweep has covered its entire scope.
+        const sweptThrough = nextSweepAnchor();
         writeCatchupHistory(historyStorageKey, {
           last_completed_at: new Date().toISOString(),
-          ...(sweptThrough ? { swept_through_at: sweptThrough } : {}),
+          swept_through_date: sweptThrough,
         });
-        historyState.swept_through_at = sweptThrough || historyState.swept_through_at;
+        historyState.swept_through_date = sweptThrough;
       }
       // Monitoring only: this timestamp never filters candidates any more.
       await this.send("REPORT_SCAN_COMPLETED", {
@@ -1227,6 +1254,7 @@ export class PageController {
     first_contact_at?: string | null;
     last_activity_at?: string | null;
     notification_version?: number;
+    own_history?: boolean;
   }): Promise<boolean> {
     if (this.stopped || !this.initialized || !this.adapter.isCandidateConversationPage())
       return false;
@@ -1237,14 +1265,23 @@ export class PageController {
     const alertKey = `${event.lookup_alert_id ?? ""}:${event.notification_version ?? 1}`;
     if (this.shownLiveAlerts.has(alertKey)) return false;
     this.shownLiveAlerts.add(alertKey);
+    // An own-history event is the viewer's own cross-job record resurfacing;
+    // wording must say "you yourself", never "another recruiter".
+    const ui = event.own_history
+      ? {
+          severity: "warning",
+          title: "你本人跟进过的候选人",
+          message: `你本人曾在其他岗位跟进过该候选人，与当前岗位不同，注意区分`,
+        }
+      : {
+          severity: "danger",
+          title: "发现重复候选人",
+          message: `${candidateName}｜${event.job_name || fields.jobDisplayName} 已被其他 BOSS 账号沟通`,
+        };
     this.panel.show({
       candidate_source_id: null,
       result_type: String(event.match_level || "CONFIRMED_DUPLICATE"),
-      ui: {
-        severity: "danger",
-        title: "发现重复候选人",
-        message: `${candidateName}｜${event.job_name || fields.jobDisplayName} 已被其他 BOSS 账号沟通`,
-      },
+      ui,
       matches: [
         {
           match_level: String(event.match_level || "CONFIRMED_DUPLICATE"),
@@ -1258,6 +1295,7 @@ export class PageController {
           last_activity_at: event.last_activity_at ?? null,
           updated_at: event.last_activity_at ?? null,
           match_reason: String(event.match_reason || "发现重复候选人证据"),
+          ...(event.own_history ? { is_own_history: true } : {}),
         },
       ],
       available_actions: [],

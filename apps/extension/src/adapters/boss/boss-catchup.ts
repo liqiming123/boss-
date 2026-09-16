@@ -26,6 +26,43 @@ export function parseBossListActivity(text: string, now = new Date()): Date | nu
   return null;
 }
 
+/** A timestamp's calendar day as a sortable number: 2026-09-16 becomes 20260916. */
+export function bossDayKey(iso: string): number {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return Number.NaN;
+  const date = new Date(ms);
+  return date.getFullYear() * 10_000 + (date.getMonth() + 1) * 100 + date.getDate();
+}
+
+/**
+ * The anchor day a sweep was handed: `YYYY-MM-DD`, or the day any timestamp
+ * falls on. Null means "no anchor", which is the explicit no-stop case.
+ */
+export function bossAnchorDay(value: string): number | null {
+  const text = value.trim();
+  if (!text) return null;
+  const day = /^(\d{4})-(\d{2})-(\d{2})/.exec(text);
+  if (day) return Number(day[1]) * 10_000 + Number(day[2]) * 100 + Number(day[3]);
+  const legacy = Date.parse(text);
+  if (!Number.isFinite(legacy)) return null;
+  const date = new Date(legacy);
+  return date.getFullYear() * 10_000 + (date.getMonth() + 1) * 100 + date.getDate();
+}
+
+/**
+ * True when a row's day falls inside the sweep the anchor opens.
+ *
+ * The sweep works in whole days: a row whose list activity is dated on or before
+ * the anchor is outside it. This is the one rule the walk's stop condition and
+ * each row's open decision share, so a stale row that happens to share a rendered
+ * batch with today's conversations is left alone instead of being re-swept.
+ */
+export function isWithinSweepScope(activity: string, anchorDay: number | null): boolean {
+  if (anchorDay === null) return true;
+  const day = bossDayKey(activity);
+  return Number.isFinite(day) && day > anchorDay;
+}
+
 /** BOSS puts an unread count immediately before the date in a list row. */
 export function hasBossUnreadBadge(text: string): boolean {
   return /^\s*\d{1,3}\s+(?=(?:昨天|今天|刚刚|\d{1,2}:\d{2}|\d{1,2}月\d{1,2}日|\d{4}[./年-]))/.test(
@@ -507,23 +544,12 @@ export async function runBossCatchup(
   // transitions stay detectable. Per-row reconciliation passes an empty
   // watermark, which means "no stop" — every row is priced individually and
   // the traversal only ends when the list is exhausted.
-  const watermarkTime = Date.parse(watermark);
-  const hasWatermark = watermark.trim().length > 0;
-  const watermarkDateKey = hasWatermark && Number.isFinite(watermarkTime)
-    ? (() => {
-        const date = new Date(watermarkTime);
-        return date.getFullYear() * 10_000 + (date.getMonth() + 1) * 100 + date.getDate();
-      })()
-    : null;
-  const isNewerThanWatermark = (rowText: string, activity: string) => {
-    if (!hasWatermark) return true;
-    if (!Number.isFinite(watermarkTime)) return true;
-    if (!isBossListActivityDateOnly(rowText)) return Date.parse(activity) > watermarkTime;
-    if (watermarkDateKey === null) return true;
-    const date = new Date(Date.parse(activity));
-    const rowDateKey = date.getFullYear() * 10_000 + (date.getMonth() + 1) * 100 + date.getDate();
-    return rowDateKey > watermarkDateKey;
-  };
+  // The anchor is a calendar day: rows dated after it are inside the sweep, rows
+  // on it or older are the boundary that stops the walk. Day granularity is what
+  // BOSS itself renders, so a row labelled `09月05日` is compared as that day
+  // rather than as midnight against a precise timestamp.
+  const anchorDay = bossAnchorDay(watermark);
+  const isNewerThanWatermark = (activity: string) => isWithinSweepScope(activity, anchorDay);
   // A pass must never fight the recruiter, but a 30-second back-off per click
   // made an active user watch "后台补扫进行中" for minutes. Ten quiet seconds is
   // enough to know the page is free; typing keeps re-arming it.
@@ -569,7 +595,7 @@ export async function runBossCatchup(
       if (container && batch.some(({ item }) => {
         const text = (item.innerText || "").replace(/\s+/g, " ").trim();
         const date = parseBossListActivity(text);
-        return !!date && !isNewerThanWatermark(text, date.toISOString());
+        return !!date && !isNewerThanWatermark(date.toISOString());
       })) {
         complete = true;
         break;

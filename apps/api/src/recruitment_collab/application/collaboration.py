@@ -68,6 +68,24 @@ def _iso_time(value: Any) -> str | None:
     return str(value)
 
 
+# BOSS renders the first chat line in the same text run as the job label, so a
+# scan reads back values such as `AI短视频内容生成师 BOSS您好,我具备岗位所需技能,…`
+# or `直播助播 您好,我想和您沟通下…`. Left in place, that text is part of the
+# candidate's identity key and of the "same job" comparison, so one candidate
+# whose conversation keeps moving gains one row per message (张雨庭 ×4). Cut at
+# the first boundary that starts a conversation rather than a title.
+_JOB_CHAT_TAIL = re.compile(
+    r"(?:"
+    # A greeting, with or without the BOSS prefix and any spacing between.
+    r"\s*(?:BOSS|boss)\s*(?=您好|你好|请问|在吗)"
+    r"|[\s　]+(?:您好|你好|请问|期待|方便|我们|目前|我是|有意向|在吗|看到)"
+    r"|[\s　]+(?:已读|未读|送达|求简历|换电话|换微信|最近关注|最近登录|最近沟通)"
+    r"|[\s　]+\d{1,2}:\d{2}"
+    r"|[，,。；;！!？?]"
+    r")"
+)
+
+
 def _canonical_job_name(value: str) -> str:
     """Remove BOSS page metadata accidentally appended to the job title.
 
@@ -80,7 +98,27 @@ def _canonical_job_name(value: str) -> str:
         text = text.split(marker, 1)[0]
     # A leaked date/time tail means the list row was captured with the title.
     text = re.split(r"\s+\d{1,2}月\d{1,2}日", text, maxsplit=1)[0]
+    chat = _JOB_CHAT_TAIL.search(text)
+    # Never cut the whole value away: a title that is nothing but punctuation is
+    # still more useful than an empty identity.
+    if chat and chat.start() > 0:
+        text = text[: chat.start()]
     return text.strip()
+
+
+def _job_label_extends(stored: str, incoming: str) -> bool:
+    """True when one job label is the other plus a chat/metadata tail.
+
+    A label this code has never seen can still be the same job with extra text
+    glued on. The leftover must itself look like that glue, so a plainly longer
+    title (``运营`` vs ``运营专员``) stays a different job with its own row.
+    """
+    if not stored or not incoming or stored == incoming:
+        return False
+    shorter, longer = (stored, incoming) if len(stored) < len(incoming) else (incoming, stored)
+    if len(shorter) < 2 or not longer.startswith(shorter):
+        return False
+    return bool(_JOB_CHAT_TAIL.search(longer[len(shorter) :]))
 
 
 STATUS_RANK = {"沟通中": 0, "已获取简历": 1, "已交换联系方式": 2, "待约面": 3, "已约面": 4, "已拒绝": 5, "已入职": 6}
@@ -453,7 +491,10 @@ class RecruitmentCollaborationService:
             # BOSS may show the account nickname while its native history shows
             # the bound Feishu real name. Resolve both labels before deciding
             # that there are two recruiters; otherwise 李先生/李启明 becomes a
-            # false self-duplicate.
+            # false self-duplicate. A same-job self row is pure noise and is
+            # suppressed; a cross-job self row is kept — it is a useful "you
+            # already followed this person under another job" reminder, and
+            # the card/UI copy marks it as the viewer's own history.
             same_job = JobNameNormalizer().normalize(_canonical_job_name(str(match.get("job_name") or ""))) == normalized_job
             if matched and matched.id == viewer.id and same_job:
                 continue
@@ -582,6 +623,20 @@ class RecruitmentCollaborationService:
         # is the only resolvable account.
         if latest["recruiter"] is None:
             return 0
+        # A cross-job row that belongs to the viewer themself is a useful
+        # "you already followed this person elsewhere" reminder, not a
+        # colleague conflict — mark it so the card never reads like one.
+        viewer_account_aliases = {
+            CandidateNameNormalizer().normalize(value)
+            for value in (viewer.display_name, viewer.feishu_display_name or "", viewer_label, payload.get("account_display_name") or "")
+            if value
+        }
+        own_group = [
+            item for item in group
+            if (item["matched"] is not None and item["matched"].id == viewer.id)
+            or CandidateNameNormalizer().normalize(item["name"]) in viewer_account_aliases
+        ]
+        own_history = bool(own_group) and len(own_group) == len(group) and latest["is_viewer"]
         # The card always describes somebody other than its recipient. When the
         # newest real conversation belongs to a colleague, that colleague is the
         # one being warned, and the recruiter on this page is who they are warned
@@ -590,7 +645,7 @@ class RecruitmentCollaborationService:
         if latest["is_viewer"]:
             others = [
                 _card_detail(item["name"], item["job_name"] or payload["job_display_name"], item["match_reason"], item["first_contact_at"], item["last_activity_at"])
-                for item in group
+                for item in (group if own_history else [item for item in group if item not in own_group])
             ]
             lead_recruiter_id = primary["matched"].id if primary["matched"] else None
         else:
@@ -621,6 +676,7 @@ class RecruitmentCollaborationService:
             "candidate_status": "沟通中" if primary.get("stage") == "FOLLOWING" else (primary.get("stage") or "沟通中"),
             "match_level": alert.match_level,
             "match_reason": lead["match_reason"],
+            "own_history": own_history,
         }
         # One card per lookup, always to the recruiter whose real conversation is
         # the newest. A colleague is only chosen when that colleague really spoke
@@ -659,6 +715,7 @@ class RecruitmentCollaborationService:
                     "first_contact_at": lead["first_contact_at"],
                     "last_activity_at": lead["last_activity_at"],
                     "notification_version": alert.notification_version,
+                    "own_history": own_history,
                 },
             )
         return queued_count
@@ -893,41 +950,86 @@ class RecruitmentCollaborationService:
             return existing
 
         job, normalized_job = self._resolve_job(company_id, payload, track_unmapped=True)
-        context = MessageContext(page, job, normalized_job, payload)
-        source, started_at, updated_at, invite_confirmed = self._upsert_candidate_source(context, confirmed_send=True)
-        self._upsert_engagement(page, source, started_at, updated_at)
-        if invite_confirmed:
-            self._store_invited_interview(source, page, job, payload)
-        self.session.add(
-            RecruitmentEvent(
-                company_id=company_id,
-                candidate_source_id=source.id,
-                job_id=source.job_id,
-                recruiter_id=page.actor_id,
-                event_type="MESSAGE_SENT",
-                event_time=payload["sent_at"],
-                source="PLUGIN",
-                idempotency_key=payload["client_event_id"],
-                metadata_json={},
-            )
+        # A confirmed send is real-time duplicate evidence, not a table write.
+        # Rows, conversation times, follow-up status and the chat long image
+        # belong to the click-sync and the scheduled history pass. The send
+        # path used to upsert its own row here; BOSS renders the profile card
+        # inconsistently between sends, so the derived identity differed and
+        # one candidate accumulated one row per send (张雨庭 ×3). Match with a
+        # transient probe — the same shape the read-only context check uses —
+        # and leave the shared table to the sync paths.
+        probe = CandidateSource(
+            company_id=company_id,
+            platform=payload["platform"],
+            platform_account_id=account.id,
+            source_identity_key="probe",
+            source_identity_type="PROBE",
+            platform_candidate_id=payload.get("platform_candidate_id"),
+            platform_id_scope=payload.get("platform_id_scope", "UNKNOWN"),
+            page_url_hash="",
+            candidate_display_name=payload["candidate_display_name"],
+            candidate_normalized_name=CandidateNameNormalizer().normalize(payload["candidate_display_name"]),
+            raw_job_name=_canonical_job_name(payload["job_display_name"]),
+            job_id=job.id if job else None,
+            extractor_version=payload["extractor_version"],
         )
-        self.session.flush()
-        matches = self._find_matches(source, page.actor_id, company_id, job.category if job else None)
+        signature = self._identity_signature(payload)
+        probe.candidate_age = payload.get("candidate_age")
+        probe.candidate_experience = normalize_experience(payload.get("candidate_experience") or "")
+        probe.candidate_education = normalize_education(payload.get("candidate_education") or "")
+        probe.candidate_identity_signature = signature
+        matches = self._find_matches(probe, page.actor_id, company_id, job.category if job else None)
         # Re-run the notification path after a confirmed outbound message.
         # The pre-send context check is best-effort; the send event is the
-        # authoritative point at which the candidate is synced and any
-        # cross-recruiter match must be surfaced to the user.
+        # authoritative point at which any cross-recruiter match must be
+        # surfaced to the user.
         lookup_notifications_queued = self._queue_lookup_alerts(company_id, current_recruiter, payload, matches)
-        self._create_conflicts(source, page.actor_id, company_id)
-        result = self._commit_candidate_response(source, account, job, current_recruiter, matches)
-        # A send never asks for a screenshot, not even the interview invitation:
-        # capturing scrolls the recruiter's own pane, and the invitation usually
-        # arrives mid-conversation with more typing to follow. The chat long
-        # image comes from the scheduled/manual history pass (one per read
-        # conversation), plus the missing-image retry above. An invitation still
-        # records the interview row and advances the status.
+        # The audit event attaches to the row this candidate already has, and
+        # the send may refresh that row's conversation time. A send never
+        # creates a row, never advances status and never asks for a screenshot:
+        # rows belong to the click-sync and the history pass, and a candidate
+        # not yet synced simply has nothing to update — the next sync or
+        # history pass records it.
+        context = MessageContext(page, job, normalized_job, payload)
+        url_hash = hashlib.sha256(payload["page_url"].encode()).hexdigest()
+        source_scope = page.actor_id if payload["platform"] == "boss" else page.account.id
+        identity = candidate_source_identity(
+            payload["platform"],
+            source_scope,
+            signature or payload["candidate_display_name"],
+            _canonical_job_name(payload["job_display_name"]),
+            "" if payload["platform"] == "boss" else url_hash,
+            payload.get("platform_candidate_id"),
+        )
+        source = self._find_candidate_source(context, identity, probe.candidate_normalized_name, signature)
+        if source:
+            source.conversation_updated_at = max(
+                (value for value in (source.conversation_updated_at, payload["sent_at"]) if value),
+                key=_epoch,
+            )
+            self.session.add(
+                RecruitmentEvent(
+                    company_id=company_id,
+                    candidate_source_id=source.id,
+                    job_id=source.job_id,
+                    recruiter_id=page.actor_id,
+                    event_type="MESSAGE_SENT",
+                    event_time=payload["sent_at"],
+                    source="PLUGIN",
+                    idempotency_key=payload["client_event_id"],
+                    metadata_json={},
+                )
+            )
+            self.session.flush()
+        result = self._response(source, account, job, current_recruiter, matches) if source else self._response(None, account, job, current_recruiter, matches)
+        # A send never asks for a screenshot and never creates a row: the
+        # history pass captures every read conversation and owns the table.
         result["snapshot_needed"] = False
         result["lookup_notifications_queued"] = lookup_notifications_queued
+        # The route's session is not committed anywhere else: without this the
+        # audit event, the refreshed conversation time and any queued alert
+        # card would be rolled back when the request closes the session.
+        self.session.commit()
         return result
 
     def sync_candidate_observation(self, company_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -983,10 +1085,16 @@ class RecruitmentCollaborationService:
         # "just looked at it" never invents a follow-up relationship, a
         # MESSAGE_SENT event or a screenshot — only the row and its times.
         result = self._commit_candidate_response(source, account, job, current_recruiter, matches)
-        # Screenshots belong to the scheduled/manual history pass (which covers
-        # the current day's conversations) and to the interview invitation
-        # handled in ``record_message_sent``. Nothing else captures, so a
-        # recruiter is never photographed mid-typing.
+        # The persistent conflict record follows the row now that sends no
+        # longer write it. Only a conversation this account really took part
+        # in (has_recruiter_outbound) may register a cross-recruiter conflict;
+        # a passive browse or a candidate-only reply never invents one, which
+        # keeps the background reconciliation pass silent.
+        if payload.get("has_recruiter_outbound") and self._create_conflicts(source, page.actor_id, company_id):
+            self.session.commit()
+        # Screenshots belong to the scheduled/manual history pass, which covers
+        # the current day's conversations. Nothing else captures, so a recruiter
+        # is never photographed mid-typing.
         result["snapshot_needed"] = sync_reason == "HISTORY_SNAPSHOT"
         # The read-only context check owns click-time notifications. Keeping
         # this write path notification-free allows lookup and persistence to
@@ -1018,11 +1126,9 @@ class RecruitmentCollaborationService:
             matches,
             idempotent=True,
         )
-        # An idempotent send retry still requests a missing/failed snapshot;
-        # this is independent of the candidate's interview status.
-        result["snapshot_needed"] = (
-            source.snapshot_status != "READY" or not source.snapshot_tokens_json
-        )
+        # A send never asks for a screenshot — not even on an idempotent retry:
+        # the history pass captures every read conversation.
+        result["snapshot_needed"] = False
         return result
 
     def _resolve_job(self, company_id: str, payload: dict[str, Any], *, track_unmapped: bool = False) -> tuple[RecruitmentJob | None, str]:
@@ -1124,11 +1230,11 @@ class RecruitmentCollaborationService:
                 source.status_evidence,
             )
             if payload.get("status_evidence") == "RECRUITER_RECONTACT_INTENT":
-                # Only a newer confirmed outbound event can reopen an old
-                # conversation. Passive observations and delayed retries
-                # must not replace its current state.
+                # Only a genuinely newer conversation may reopen an old one.
+                # Passive re-reads and delayed retries carry an older or equal
+                # time and must not replace the current state.
                 accepted_status = None
-                if (confirmed_send and payload.get("recruitment_status") in {"沟通中", "待约面"}
+                if (payload.get("recruitment_status") in {"沟通中", "待约面"}
                         and (source.conversation_updated_at is None
                              or _epoch(sent_at) > _epoch(source.conversation_updated_at))):
                     accepted_status = (payload["recruitment_status"], "RECRUITER_RECONTACT_INTENT")
@@ -1223,6 +1329,19 @@ class RecruitmentCollaborationService:
             for row in candidates
             if JobNameNormalizer().normalize(_canonical_job_name(row.raw_job_name)) == canonical_job
         ]
+        if not same_job:
+            # The job label can still carry a tail no rule has seen yet. When
+            # the stored title is the one just read plus chat/metadata glue, it
+            # is the same job rendered with extra text: reuse that row instead
+            # of giving one candidate a second row per distinct chat line.
+            same_job = [
+                row
+                for row in candidates
+                if _job_label_extends(
+                    JobNameNormalizer().normalize(_canonical_job_name(row.raw_job_name)),
+                    canonical_job,
+                )
+            ]
         source = next(
             (
                 row
@@ -1379,6 +1498,28 @@ class RecruitmentCollaborationService:
         fields = self._response(source, account, mapped_job, recruiter, [])["feishu_candidate_fields"]
         self._queue_candidate_sync(source, fields)
 
+    @staticmethod
+    def _mark_own_match(item: dict[str, Any], current_recruiter: Any, account: Any) -> dict[str, Any]:
+        """Tag matches that belong to the viewer themself.
+
+        A cross-job own row is kept in the matches (it is a useful "you
+        already followed this person elsewhere" reminder) but must never be
+        worded as a colleague conflict, so the UI layers can tell them apart.
+        """
+        own = current_recruiter is not None and item.get("recruiter_id") == current_recruiter.id
+        if not own:
+            names = {
+                CandidateNameNormalizer().normalize(value)
+                for value in (
+                    current_recruiter.display_name if current_recruiter else "",
+                    current_recruiter.feishu_display_name if current_recruiter and current_recruiter.feishu_display_name else "",
+                    account.account_display_name if account else "",
+                )
+                if value
+            }
+            own = CandidateNameNormalizer().normalize(str(item.get("recruiter_name") or "")) in names
+        return {**item, "is_own_history": True} if own else item
+
     def _response(
         self,
         source: CandidateSource | None,
@@ -1388,10 +1529,28 @@ class RecruitmentCollaborationService:
         matches: list[dict[str, Any]],
         idempotent: bool = False,
     ) -> dict[str, Any]:
-        if not matches:
+        annotated = [self._mark_own_match(item, current_recruiter, account) for item in matches]
+        colleagues = [item for item in annotated if not item.get("is_own_history")]
+        if not annotated:
             result_type, severity, title, message = "NO_HISTORY", "success", "暂无其他同事记录", "候选人已同步"
+        elif not colleagues:
+            first = annotated[0]
+            result_type = {
+                "CONFIRMED_BOSS_HISTORY": "CONFIRMED_DUPLICATE",
+                "EXACT_IDENTITY": "CONFIRMED_DUPLICATE",
+                "CONFIRMED_PLATFORM_ID": "CONFIRMED_DUPLICATE",
+                "SUSPECTED_SAME_NAME_JOB": "SUSPECTED_DUPLICATE",
+                "POSSIBLE_SAME_NAME_CATEGORY": "POSSIBLE_DUPLICATE",
+                "HISTORICAL_SAME_NAME": "HISTORICAL_RECORD",
+            }[first["match_level"]]
+            severity = "warning"
+            title = "你本人跟进过的候选人"
+            message = (
+                f"你本人曾在其他岗位「{first.get('job_name') or '未知岗位'}」跟进过该候选人，"
+                "与本次岗位不同，注意区分，不会影响当前跟进"
+            )
         else:
-            first = matches[0]
+            first = colleagues[0]
             result_type = {
                 "CONFIRMED_BOSS_HISTORY": "CONFIRMED_DUPLICATE",
                 "EXACT_IDENTITY": "CONFIRMED_DUPLICATE",
@@ -1419,13 +1578,13 @@ class RecruitmentCollaborationService:
             ),
             "result_type": result_type,
             "ui": {"severity": severity, "title": title, "message": message},
-            "matches": matches,
+            "matches": annotated,
             "history_summary": {
-                "other_recruiter_count": len({item["recruiter_id"] for item in matches}),
-                "contacted_by_others": any(item["history"]["contacted"] for item in matches),
-                "interviewed_by_others": any(item["history"]["interviewed"] for item in matches),
-                "rejected_by_others": any(item["history"]["rejected"] for item in matches),
-                "multiple_recruiters": bool(matches),
+                "other_recruiter_count": len({item["recruiter_id"] for item in colleagues}),
+                "contacted_by_others": any(item["history"]["contacted"] for item in colleagues),
+                "interviewed_by_others": any(item["history"]["interviewed"] for item in colleagues),
+                "rejected_by_others": any(item["history"]["rejected"] for item in colleagues),
+                "multiple_recruiters": bool(colleagues),
             },
             "idempotent": idempotent,
             "available_actions": ["VIEW_TIMELINE", "NOT_SAME_PERSON"],

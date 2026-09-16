@@ -206,6 +206,20 @@ async function digest(parts: string[]) {
 }
 
 export async function captureBossConversationSnapshot(): Promise<SnapshotResult> {
+  // The floating panel is fixed over the conversation area and the catch-up
+  // banner is visible exactly while snapshots are taken, so captureVisibleTab
+  // would bake it into every stitched tile of the long image. Hide the panel
+  // host for the duration of the capture and restore it afterwards.
+  const panelHost = document.getElementById("recruitment-collab-host");
+  if (panelHost) panelHost.style.display = "none";
+  try {
+    return await captureConversationTiles();
+  } finally {
+    if (panelHost) panelHost.style.display = "";
+  }
+}
+
+async function captureConversationTiles(): Promise<SnapshotResult> {
   const scroller = chatScroller();
   if (!scroller) {
     // BOSS virtualizes the chat list in some versions and exposes no usable

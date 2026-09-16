@@ -9,9 +9,9 @@ from recruitment_collab.workers import data_retention_worker
 
 
 def test_synced_candidate_cache_is_minimized_but_operational_keys_remain(client, session, monkeypatch):
-    from test_api_flow import context, message_sent
+    from test_api_flow import context, conversation_sync
 
-    source_id = message_sent(client, {}, context("待最小化候选人", "谢女士", "retention")).json()["candidate_source_id"]
+    source_id = conversation_sync(client, {}, context("待最小化候选人", "谢女士", "retention")).json()["candidate_source_id"]
     source = session.get(CandidateSource, source_id)
     source.feishu_record_id = "rec-feishu"
     source.last_seen_at = now() - timedelta(days=31)
@@ -34,9 +34,9 @@ def test_synced_candidate_cache_is_minimized_but_operational_keys_remain(client,
 
 
 def test_stale_unsynced_candidate_is_minimized_after_sync_reaches_terminal_state(client, session, monkeypatch):
-    from test_api_flow import context, message_sent
+    from test_api_flow import context, conversation_sync
 
-    source_id = message_sent(client, {}, context("未同步但已失败候选人", "谢女士", "unsynced-retention")).json()["candidate_source_id"]
+    source_id = conversation_sync(client, {}, context("未同步但已失败候选人", "谢女士", "unsynced-retention")).json()["candidate_source_id"]
     source = session.get(CandidateSource, source_id)
     source.last_seen_at = now() - timedelta(days=31)
     outbox = session.scalar(select(CandidateSyncOutbox).where(CandidateSyncOutbox.candidate_source_id == source_id))
@@ -66,9 +66,9 @@ def test_stale_unsynced_candidate_is_minimized_after_sync_reaches_terminal_state
 
 
 def test_active_unsynced_candidate_is_kept_for_worker_retry(client, session, monkeypatch):
-    from test_api_flow import context, message_sent
+    from test_api_flow import context, conversation_sync
 
-    source_id = message_sent(client, {}, context("等待同步候选人", "谢女士", "pending-retention")).json()["candidate_source_id"]
+    source_id = conversation_sync(client, {}, context("等待同步候选人", "谢女士", "pending-retention")).json()["candidate_source_id"]
     source = session.get(CandidateSource, source_id)
     source.last_seen_at = now() - timedelta(days=31)
     session.commit()
@@ -85,9 +85,9 @@ def test_active_unsynced_candidate_is_kept_for_worker_retry(client, session, mon
 
 
 def test_failed_candidate_sync_payload_is_cleared_after_retention(client, session, monkeypatch):
-    from test_api_flow import context, message_sent
+    from test_api_flow import context, conversation_sync
 
-    source_id = message_sent(client, {}, context("失败载荷候选人", "谢女士", "failed-retention")).json()["candidate_source_id"]
+    source_id = conversation_sync(client, {}, context("失败载荷候选人", "谢女士", "failed-retention")).json()["candidate_source_id"]
     row = session.scalar(select(CandidateSyncOutbox).where(CandidateSyncOutbox.candidate_source_id == source_id))
     row.status = "FAILED"
     row.updated_at = now() - timedelta(days=31)

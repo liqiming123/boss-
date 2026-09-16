@@ -75,6 +75,29 @@ describe("Boss adapter", () => {
       value: { displayName: "成珈莉" },
     });
   });
+  it("recognises nickname-style account names carrying letters or digits", async () => {
+    // BOSS-side nicknames are not real names: the account rules must not veto
+    // them the way the candidate rules do, or a fresh install can never bind.
+    history.replaceState({}, "", "/web/chat/interaction");
+    document.body.innerText = "职位管理\n账号权益\nAmy王\n互动";
+    expect(await new BossAdapter().extractAccount()).toEqual({
+      status: "OK",
+      value: { displayName: "Amy王" },
+    });
+    document.body.innerText = "职位管理\n账号权益\n招聘01\n互动";
+    expect(await new BossAdapter().extractAccount()).toEqual({
+      status: "OK",
+      value: { displayName: "招聘01" },
+    });
+  });
+  it("keeps a chat line after the account chip from becoming the account name", async () => {
+    history.replaceState({}, "", "/web/chat/interaction");
+    document.body.innerText = "职位管理\n账号权益\n有剧本吗\n互动";
+    expect(await new BossAdapter().extractAccount()).toEqual({
+      status: "ERROR",
+      errorCode: "BOSS_FIELDS_NOT_FOUND",
+    });
+  });
   it("accepts candidate display names ending in 女士", async () => {
     document.body.innerText =
       "升级VIP\n成珈莉\n贾女士\n28岁\n3年\n本科\n沟通职位：业务助理";
@@ -203,6 +226,15 @@ describe("Boss adapter", () => {
     expect(await new BossAdapter().extractJob()).toEqual({
       status: "OK",
       value: { displayName: "直播助播" },
+    });
+    // The real BOSS line prefixes the greeting with the account name; the
+    // leftover used to survive into the identity key and create one row per
+    // message for the same candidate.
+    document.body.innerText =
+      "升级VIP\n成珈莉\n张雨庭\n19岁\n27届\n大专\n沟通职位：AI短视频内容生成师 BOSS您好,我具备岗位所需技能,且学习能力强,可以给您发简历看看吗? 10:33 已读 这个是AI相关的岗位";
+    expect(await new BossAdapter().extractJob()).toEqual({
+      status: "OK",
+      value: { displayName: "AI短视频内容生成师" },
     });
   });
   it("keeps legitimate compound job titles intact", async () => {

@@ -262,6 +262,16 @@ class BitableSyncClient:
                 self._data(client.put(f"{base}/{record_id}", headers=headers, json={"fields": {"候选人": "__RECRUITMENT_TABLE_PROBE_OK__"}}))
                 self._data(client.delete(f"{base}/{record_id}", headers=headers))
 
+    def delete_candidate(self, record_id: str) -> None:
+        """Delete one candidate record, for removing a confirmed duplicate row."""
+        if self.settings.feishu_mode != "real" or not self.app_token or not self.candidate_table_id:
+            raise RuntimeError("FEISHU_TABLE_NOT_CONFIGURED")
+        if not record_id:
+            raise RuntimeError("FEISHU_RECORD_ID_REQUIRED")
+        with httpx.Client(timeout=30) as client:
+            headers = {**self._headers(client), "Content-Type": "application/json"}
+            self._data(client.delete(f"{self._table_url('records')}/{record_id}", headers=headers))
+
     def clear_records(self) -> int:
         """Delete all records in bounded batches after explicit confirmation."""
         if self.settings.feishu_mode != "real" or not self.app_token or not self.candidate_table_id:

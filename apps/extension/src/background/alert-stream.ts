@@ -23,6 +23,7 @@ export type LiveAlertEvent = {
   first_contact_at?: string | null;
   last_activity_at?: string | null;
   notification_version?: number;
+  own_history?: boolean;
 };
 
 const BOSS_TAB_URLS = [

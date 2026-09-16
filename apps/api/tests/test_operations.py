@@ -24,7 +24,7 @@ def test_management_route_uses_active_company_scope(client):
 
 def test_operations_reports_workers_queues_bindings_and_allows_device_revoke(client, session):
     from conftest import login
-    from test_api_flow import context, message_sent
+    from test_api_flow import context, conversation_sync, message_sent
 
     admin_headers = login(client, "admin@example.com")
     recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
@@ -53,7 +53,10 @@ def test_operations_reports_workers_queues_bindings_and_allows_device_revoke(cli
     for name in ("candidate-sync-worker", "notification-worker", "data-retention-worker"):
         session.add(WorkerHeartbeat(worker_name=name, status="HEALTHY", last_seen_at=now(), last_success_at=now()))
     session.commit()
-    assert message_sent(client, login(client, "xie@example.com"), context("运维候选人", "谢女士", "operations")).status_code == 200
+    seeded = context("运维候选人", "谢女士", "operations")
+    assert conversation_sync(client, login(client, "xie@example.com"), seeded).status_code == 200
+    # The row exists now, so a real send registers its audit event.
+    assert message_sent(client, login(client, "xie@example.com"), seeded).status_code == 200
 
     response = client.get("/api/v1/admin/operations", headers=admin_headers)
     assert response.status_code == 200

@@ -382,11 +382,16 @@ class FeishuOAuthClient:
 class FeishuCardBuilder:
     def duplicate_card(self, payload: dict[str, Any]) -> dict[str, Any]:
         browsing = payload.get("type") == "DUPLICATE_LOOKUP"
+        # An own-history card reminds the recruiter of their own cross-job
+        # follow-up; it is not a conflict and must not read like one.
+        own_history = bool(payload.get("own_history"))
         # A lookup card triggered by a confirmed outbound message is not a
         # browse: the recipient is the recruiter who just wrote to the
         # candidate, so say what actually happened.
         title = (
-            "候选人重复沟通提醒"
+            "你本人在其他岗位的跟进提醒"
+            if own_history
+            else "候选人重复沟通提醒"
             if browsing and payload.get("trigger") == "SEND"
             else "候选人浏览查重提醒"
             if browsing
@@ -398,17 +403,41 @@ class FeishuCardBuilder:
         if isinstance(details, list) and len(details) > 1:
             # One candidate, several other recruiters: a single card that lists
             # them all, instead of one near-identical card each.
-            lines = [
-                f"**其他招聘者**：{payload.get('matched_recruiter_name', '未知')}（共 {len(details)} 人）"
-            ]
-            for item in details:
-                lines.append(
-                    f"- {item.get('recruiter_name', '未知')}｜{item.get('job_name') or '岗位未知'}"
-                    f"｜首次沟通 {item.get('first_contact_at') or '未知'}"
-                    f"｜最近活动 {item.get('last_activity_at') or '未知'}"
-                    f"｜{item.get('match_reason') or '历史记录'}"
-                )
+            if own_history:
+                lines = ["**你本人**曾在以下其他岗位跟进该候选人："]
+                for item in details:
+                    lines.append(
+                        f"- {item.get('job_name') or '岗位未知'}"
+                        f"｜首次沟通 {item.get('first_contact_at') or '未知'}"
+                        f"｜最近活动 {item.get('last_activity_at') or '未知'}"
+                    )
+            else:
+                lines = [
+                    f"**其他招聘者**：{payload.get('matched_recruiter_name', '未知')}（共 {len(details)} 人）"
+                ]
+                for item in details:
+                    lines.append(
+                        f"- {item.get('recruiter_name', '未知')}｜{item.get('job_name') or '岗位未知'}"
+                        f"｜首次沟通 {item.get('first_contact_at') or '未知'}"
+                        f"｜最近活动 {item.get('last_activity_at') or '未知'}"
+                        f"｜{item.get('match_reason') or '历史记录'}"
+                    )
             matched_lines = "\n".join(lines)
+        elif own_history:
+            if isinstance(details, list) and details:
+                matched_lines = (
+                    f"**你本人**曾在其他岗位跟进该候选人\n"
+                    f"**跟进岗位**：{details[0].get('job_name') or '岗位未知'}\n"
+                    f"**首次沟通**：{payload.get('first_contact_at') or '未知'}\n"
+                    f"**最近活动**：{payload.get('last_activity_at') or '未知'}"
+                )
+            else:
+                matched_lines = (
+                    f"**你本人**曾在其他岗位跟进该候选人\n"
+                    f"**首次沟通**：{payload.get('first_contact_at') or '未知'}\n"
+                    f"**最近活动**：{payload.get('last_activity_at') or '未知'}\n"
+                    f"**匹配依据**：{payload.get('match_reason', '未知')}"
+                )
         else:
             matched_lines = (
                 f"**其他招聘者**：{payload.get('matched_recruiter_name', '未知')}\n"

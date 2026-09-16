@@ -12,6 +12,8 @@ export type ContextMatch = {
   match_reason: string;
   evidence_source?: string;
   feishu_synced?: boolean;
+  /** Set when the match belongs to the viewing recruiter themself. */
+  is_own_history?: boolean;
 };
 export type ContextResponse = {
   candidate_source_id: string | null;

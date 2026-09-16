@@ -290,9 +290,9 @@ def test_bitable_snapshot_resolves_wiki_alias_before_media_upload(monkeypatch):
 
 def test_mock_worker_marks_queued_candidate_as_sent(client, session, monkeypatch):
     from conftest import login
-    from test_api_flow import context, message_sent
+    from test_api_flow import context, conversation_sync
 
-    response = message_sent(client, login(client, "xie@example.com"), context("队列候选人", "谢女士", "queue"))
+    response = conversation_sync(client, login(client, "xie@example.com"), context("队列候选人", "谢女士", "queue"))
     assert response.status_code == 200
     factory = sessionmaker(bind=session.bind, expire_on_commit=False)
     monkeypatch.setattr(candidate_sync_worker, "SessionLocal", factory)

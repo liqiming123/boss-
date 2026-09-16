@@ -1,16 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   bossRowMatchesCandidate,
+  dateKey,
+  dateKeyString,
   historyCatchupDueAt,
   isSuspiciousEmptyPass,
-  lastCatchupWindowMs,
   nextCatchupWindowDelayMs,
   nextSweepAnchor,
   pageOpenSweepDue,
   PageController,
-  sweepAnchor,
-  sweepStartAnchor,
-  sweepWindowStart,
+  sweepAnchorDay,
 } from "../src/content/page-controller";
 import type {
   AdapterDiagnostics,
@@ -19,6 +18,7 @@ import type {
   RecruitmentSiteAdapter,
 } from "../src/adapters/types";
 import { classifyBossOutgoingMessage } from "../src/adapters/boss/boss-status";
+import { isWithinSweepScope } from "../src/adapters/boss/boss-catchup";
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 const eventually = async (predicate: () => boolean) => {
@@ -210,46 +210,60 @@ describe("Page controller candidate activation", () => {
       ),
     ).toBe(false);
   });
-  it("starts catch-up when the live company setting repairs a stale disabled cache", async () => {
-    const sendMessage = vi
-      .fn()
-      .mockImplementation(({ type }: { type: string }) => {
-        if (type === "GET_AUTH")
-          return Promise.resolve({
-            ok: true,
-            data: {
-              apiBaseUrl: "https://api.example.com/api/v1",
-              catchupEnabled: false,
-            },
-          });
-        if (type === "GET_PLUGIN_SETTINGS")
-          return Promise.resolve({ ok: true, data: { catchup_enabled: true } });
-        if (type === "GET_CONVERSATION_INDEX")
-          return Promise.resolve({
-            ok: true,
-            data: { completed_through_at: "2026-09-03T00:00:00.000Z" },
-          });
+  it("leaves a page open alone once today's 23:30 window has been swept", async () => {
+    vi.useFakeTimers();
+    const key = "boss-catchup-history:页面账号";
+    const store: Record<string, unknown> = {
+      [key]: { last_completed_at: new Date().toISOString() },
+    };
+    const sendMessage = vi.fn().mockImplementation(({ type }: { type: string }) => {
+      if (type === "GET_AUTH")
         return Promise.resolve({
           ok: true,
           data: {
-            candidate_source_id: null,
-            result_type: "CHECK_ONLY_NO_HISTORY",
-            ui: { severity: "success", title: "", message: "" },
-            matches: [],
-            available_actions: [],
-            account_mapping: {},
-            job_mapping: {},
+            apiBaseUrl: "https://api.example.com/api/v1",
+            catchupEnabled: false,
           },
         });
-      });
-    vi.stubGlobal("chrome", { runtime: { sendMessage } });
-    new PageController(new CandidateSwitchAdapter()).start();
-    await tick();
-    await tick();
-    expect(sendMessage.mock.calls.some(([message]) => message.type === "GET_CONVERSATION_INDEX")).toBe(true);
+      if (type === "GET_PLUGIN_SETTINGS")
+        return Promise.resolve({ ok: true, data: { catchup_enabled: true } });
+      return Promise.resolve({ ok: true, data: {} });
+    });
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: (name: string, callback: (value: Record<string, unknown>) => void) =>
+            callback(store[name] === undefined ? {} : { [name]: store[name] }),
+          set: (value: Record<string, unknown>, callback?: () => void) => {
+            Object.assign(store, value);
+            callback?.();
+          },
+        },
+      },
+    });
+    const controller = new PageController(new CandidateSwitchAdapter());
+    controller.start();
+    // The live switch repairs the stale local cache, but today's window is
+    // already covered, so opening the page must not traverse — not even after
+    // the quiet period a missed window would have to wait out. The light
+    // per-open reconcile was removed: only a missed window traverses.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(
+      sendMessage.mock.calls.some(
+        ([message]) => message.type === "GET_CONVERSATION_INDEX",
+      ),
+    ).toBe(false);
+    controller.stopCatchup();
+    vi.useRealTimers();
   });
-  it("waits for the BOSS account shell during the initialization pass", async () => {
+  it("waits for the BOSS account shell before sweeping a missed window", async () => {
     vi.useFakeTimers();
+    const key = "boss-catchup-history:页面账号";
+    const store: Record<string, unknown> = {
+      // Yesterday's pass does not cover the window that has since passed.
+      [key]: { last_completed_at: "2026-09-14T21:05:00+08:00" },
+    };
     const sendMessage = vi.fn().mockImplementation(({ type }: { type: string }) => {
       if (type === "GET_AUTH")
         return Promise.resolve({ ok: true, data: { catchupEnabled: true } });
@@ -262,17 +276,38 @@ describe("Page controller candidate activation", () => {
         });
       return Promise.resolve({ ok: true, data: {} });
     });
-    vi.stubGlobal("chrome", { runtime: { sendMessage } });
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: (name: string, callback: (value: Record<string, unknown>) => void) =>
+            callback(store[name] === undefined ? {} : { [name]: store[name] }),
+          set: (value: Record<string, unknown>, callback?: () => void) => {
+            Object.assign(store, value);
+            callback?.();
+          },
+        },
+      },
+    });
     const adapter = new CandidateSwitchAdapter();
     let accountAttempts = 0;
     adapter.extractAccount = async () =>
       ++accountAttempts < 3
         ? { status: "ERROR", errorCode: "BOSS_FIELDS_NOT_FOUND" }
         : { status: "OK", value: { displayName: "页面账号" } };
-    new PageController(adapter).start();
-    await vi.advanceTimersByTimeAsync(1_100);
+    const controller = new PageController(adapter);
+    controller.start();
+    // The shell is painted in stages on a reload, so the make-up sweep keeps
+    // re-reading the account instead of giving up on the first miss.
+    await vi.advanceTimersByTimeAsync(90_000);
     expect(accountAttempts).toBeGreaterThanOrEqual(3);
-    expect(sendMessage.mock.calls.some(([message]) => message.type === "GET_CONVERSATION_INDEX")).toBe(true);
+    expect(
+      sendMessage.mock.calls.some(
+        ([message]) => message.type === "GET_CONVERSATION_INDEX",
+      ),
+    ).toBe(true);
+    controller.stopCatchup();
+    vi.useRealTimers();
   });
   it("does not turn historical outbound evidence into a new conversation event", async () => {
     const sendMessage = vi.fn().mockImplementation(({ type }: { type: string }) =>
@@ -421,26 +456,22 @@ describe("Page controller candidate activation", () => {
     expect(nextCatchupWindowDelayMs(at("2026-09-16T00:30:00+08:00"))).toBe(23 * 60 * 60 * 1000);
     expect(nextCatchupWindowDelayMs(at("2026-09-16T09:00:00+08:00"))).toBe(14.5 * 60 * 60 * 1000);
   });
-  it("knows when a sweep window passed without a completed pass", () => {
+  it("owes a sweep when a window passed without a completed pass", () => {
     const at = (value: string) => Date.parse(value);
-    expect(lastCatchupWindowMs(at("2026-09-15T10:00:00+08:00"))).toBe(at("2026-09-14T23:30:00+08:00"));
-    expect(lastCatchupWindowMs(at("2026-09-15T23:00:00+08:00"))).toBe(at("2026-09-14T23:30:00+08:00"));
-    expect(lastCatchupWindowMs(at("2026-09-15T23:45:00+08:00"))).toBe(at("2026-09-15T23:30:00+08:00"));
-    expect(lastCatchupWindowMs(at("2026-09-16T00:30:00+08:00"))).toBe(at("2026-09-15T23:30:00+08:00"));
-
     const now = at("2026-09-15T14:30:00+08:00");
-    // Never swept on this machine: the day's conversations are still owed.
+    // Never swept on this machine: the window before 14:30 is still owed.
     expect(historyCatchupDueAt({}, now)).toBe(true);
-    // Last night's sweep does not cover the window that just closed... it does,
-    // because the newest window before 14:30 is yesterday 23:30.
+    // Last night's sweep covers the window that closed at 23:30.
     expect(historyCatchupDueAt({ last_completed_at: "2026-09-14T23:35:00+08:00" }, now)).toBe(false);
-    // An older sweep leaves today's window owed.
+    // A pass from yesterday afternoon is behind that window.
     expect(historyCatchupDueAt({ last_completed_at: "2026-09-14T22:00:00+08:00" }, now)).toBe(true);
+    // A sweep that already ran this morning satisfies the same window.
+    expect(historyCatchupDueAt({ last_completed_at: "2026-09-15T09:05:00+08:00" }, now)).toBe(false);
     // A sweep that started ten minutes ago is not repeated on every reload.
     expect(historyCatchupDueAt({ last_attempt_at: "2026-09-15T14:20:00+08:00" }, now)).toBe(false);
     // ...but an old failed/never-finished attempt is retried.
     expect(historyCatchupDueAt({ last_attempt_at: "2026-09-15T10:00:00+08:00" }, now)).toBe(true);
-    // After tonight's window a new day starts owing a sweep again.
+    // Tonight's window owes another pass.
     expect(
       historyCatchupDueAt(
         { last_completed_at: "2026-09-15T14:10:00+08:00" },
@@ -593,47 +624,47 @@ describe("Page controller candidate activation", () => {
     ).toBe(false);
     document.body.innerHTML = "";
   });
-  it("anchors a sweep at the newest conversation it already covered", () => {
+  it("anchors a sweep on the last calendar day it covered", () => {
     const at = (value: string) => Date.parse(value);
     const now = at("2026-09-15T14:30:00+08:00");
-    // No anchor yet: the first pass may not skip anything on its own.
-    expect(sweepAnchor({}, now)).toBe("");
-    expect(sweepAnchor({ swept_through_at: "not-a-time" }, now)).toBe("");
-    // A usable anchor is handed to the traversal as-is.
-    expect(sweepAnchor({ swept_through_at: "2026-09-15T13:00:00+08:00" }, now)).toBe(
-      new Date("2026-09-15T13:00:00+08:00").toISOString(),
-    );
-    // A parsed list time in the future must not lock every later sweep out.
-    expect(sweepAnchor({ swept_through_at: "2026-09-15T16:39:00+08:00" }, now)).toBe("");
+    // Nothing covered yet: the sweep starts at yesterday, so today is the scope
+    // and a fresh install never walks the whole list.
+    expect(dateKeyString(sweepAnchorDay({}, now))).toBe("2026-09-14");
+    expect(dateKeyString(sweepAnchorDay({ swept_through_at: "not-a-time" }, now))).toBe("2026-09-14");
+    // A pass that ran yesterday left the anchor on the day before it, so the
+    // scope still contains the day that just ended — the day a browser closed at
+    // 23:30 would otherwise never have swept.
+    expect(dateKeyString(sweepAnchorDay({ swept_through_date: "2026-09-13" }, now))).toBe("2026-09-13");
+    // A browser that was away for longer makes the next visit cover every
+    // missed day as well.
+    expect(dateKeyString(sweepAnchorDay({ swept_through_date: "2026-09-12" }, now))).toBe("2026-09-12");
+    // An anchor from today or later cannot widen the scope past today.
+    expect(dateKeyString(sweepAnchorDay({ swept_through_date: "2026-09-15" }, now))).toBe("2026-09-14");
+    expect(dateKeyString(sweepAnchorDay({ swept_through_date: "2027-01-01" }, now))).toBe("2026-09-14");
+    // Installs that still carry only the older timestamp anchor, or only a
+    // completion time, keep the day those values fell on.
+    expect(dateKeyString(sweepAnchorDay({ swept_through_at: "2026-09-13T22:10:00+08:00" }, now))).toBe("2026-09-13");
+    expect(dateKeyString(sweepAnchorDay({ last_completed_at: "2026-09-13T23:35:00+08:00" }, now))).toBe("2026-09-13");
 
-    // A finished sweep moves the anchor forward, never backwards, never future.
-    expect(
-      nextSweepAnchor("2026-09-15T13:00:00+08:00", "2026-09-15T14:10:00+08:00", now),
-    ).toBe(new Date("2026-09-15T14:10:00+08:00").toISOString());
-    expect(
-      nextSweepAnchor("2026-09-15T14:20:00+08:00", "2026-09-15T13:10:00+08:00", now),
-    ).toBe(new Date("2026-09-15T14:20:00+08:00").toISOString());
-    expect(nextSweepAnchor("", "2026-09-15T20:00:00+08:00", now)).toBe(new Date(now).toISOString());
-    expect(nextSweepAnchor("", "")).toBe("");
-
-    // A sweep reads from the start of the current 23:30 cycle: "today" is one
-    // 23:30 → 23:30 day, so an older backlog is never re-scanned.
-    expect(sweepWindowStart(at("2026-09-15T14:30:00+08:00"))).toBe(at("2026-09-14T23:30:00+08:00"));
-    // A pass that fires inside the 23:30 minute covers the cycle that just ended.
-    expect(sweepWindowStart(at("2026-09-15T23:30:30+08:00"))).toBe(at("2026-09-14T23:30:00+08:00"));
-    expect(sweepWindowStart(at("2026-09-15T23:45:00+08:00"))).toBe(at("2026-09-15T23:30:00+08:00"));
-    // No stored anchor yet → today's boundary.
-    expect(sweepStartAnchor({}, at("2026-09-15T14:30:00+08:00"))).toBe(
-      new Date(at("2026-09-14T23:30:00+08:00")).toISOString(),
-    );
-    // A sweep that already covered part of today keeps its newer anchor...
-    expect(
-      sweepStartAnchor({ swept_through_at: "2026-09-15T13:00:00+08:00" }, at("2026-09-15T14:30:00+08:00")),
-    ).toBe(new Date("2026-09-15T13:00:00+08:00").toISOString());
-    // ...while a stale anchor from days ago never drags the backlog back in.
-    expect(
-      sweepStartAnchor({ swept_through_at: "2026-09-12T09:00:00+08:00" }, at("2026-09-15T14:30:00+08:00")),
-    ).toBe(new Date(at("2026-09-14T23:30:00+08:00")).toISOString());
+    // A finished sweep records the day that has ended, not the one it ran in:
+    // a sweep can only ever see its own day part-way through.
+    expect(nextSweepAnchor(now)).toBe("2026-09-14");
+    expect(nextSweepAnchor(at("2026-09-16T00:30:00+08:00"))).toBe("2026-09-15");
+  });
+  it("keeps rows from an already covered day out of the sweep scope", () => {
+    // The anchor is the last day a sweep covered: 2026-09-14 was covered, so
+    // today is the scope.
+    const anchor = dateKey(Date.parse("2026-09-14T00:00:00+08:00"));
+    expect(isWithinSweepScope(new Date("2026-09-15T09:20:00+08:00").toISOString(), anchor)).toBe(true);
+    // Yesterday 23:51 is not, even though it is only minutes older: the sweep
+    // compares the day, which is how BOSS labels the list.
+    expect(isWithinSweepScope(new Date("2026-09-14T23:51:00+08:00").toISOString(), anchor)).toBe(false);
+    // A date-only label is compared as that day too.
+    expect(isWithinSweepScope(new Date("2026-09-14T00:00:00+08:00").toISOString(), anchor)).toBe(false);
+    // A browser that missed days covers everything after the covered day.
+    expect(isWithinSweepScope(new Date("2026-09-14T23:51:00+08:00").toISOString(), dateKey(Date.parse("2026-09-13T00:00:00+08:00")))).toBe(true);
+    // With no anchor at all nothing is restricted.
+    expect(isWithinSweepScope(new Date("2026-09-14T23:51:00+08:00").toISOString(), null)).toBe(true);
   });
   it("runs scheduled and manual catch-up in full history snapshot mode", async () => {
     vi.useFakeTimers();
@@ -1084,8 +1115,10 @@ describe("Page controller candidate activation", () => {
       expect.objectContaining({ snapshotCapture: true }),
     );
   });
-  it("captures a confirmed send only when the server asks for one", async () => {
-    let snapshotRequested = false;
+  it("never captures on a confirmed send, even when the server asks for one", async () => {
+    // The history pass owns every capture. A send only registers the event, so
+    // even a server that still answers `snapshot_needed: true` must not scroll
+    // and photograph the pane the recruiter is typing in.
     const sendMessage = vi.fn().mockImplementation(({ type }: { type: string }) => {
       if (type === "GET_AUTH")
         return Promise.resolve({ ok: true, data: { catchupEnabled: false } });
@@ -1097,7 +1130,7 @@ describe("Page controller candidate activation", () => {
         available_actions: [],
         account_mapping: {},
         job_mapping: {},
-        ...(type === "MESSAGE_SENT" ? { snapshot_needed: snapshotRequested } : {}),
+        ...(type === "MESSAGE_SENT" ? { snapshot_needed: true } : {}),
       };
       return Promise.resolve({ ok: true, data });
     });
@@ -1143,10 +1176,8 @@ describe("Page controller candidate activation", () => {
       ),
     ).toBe(false);
 
-    // The interview invitation: the server asks for the image. jsdom has no
-    // BOSS chat region, so reaching the capture path is observed through its
-    // sanitized failure report.
-    snapshotRequested = true;
+    // The interview invitation is a send like any other: the long image stays
+    // the history pass's job, so no capture is requested or attempted.
     adapter.messageCallback({
       sentAt: "2026-09-02T08:05:00.000Z",
       messageText: "您好，想和您约个面试时间",
@@ -1158,11 +1189,19 @@ describe("Page controller candidate activation", () => {
         observedAt: "2026-09-02T08:05:00.000Z",
       },
     });
-    await eventually(() =>
+    await eventually(
+      () =>
+        sendMessage.mock.calls.filter(
+          ([message]) => message.type === "MESSAGE_SENT",
+        ).length >= 2,
+    );
+    await tick();
+    await tick();
+    expect(
       sendMessage.mock.calls.some(
         ([message]) => message.type === "REPORT_SNAPSHOT_STATUS",
       ),
-    );
+    ).toBe(false);
     expect(
       sendMessage.mock.calls.some(
         ([message]) => message.type === "UPLOAD_SNAPSHOT",

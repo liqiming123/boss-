@@ -2,7 +2,7 @@ from urllib.parse import parse_qs, urlparse
 
 from conftest import login
 from sqlalchemy import select
-from test_api_flow import context, message_sent
+from test_api_flow import context, conversation_sync
 
 from recruitment_collab.api import routes
 from recruitment_collab.config.settings import get_settings
@@ -132,7 +132,7 @@ def test_admin_console_shows_plugin_boss_sync_data_after_binding(client, session
     assert tokens["status"] == "APPROVED"
 
     # The plugin syncs one candidate from that BOSS account.
-    sent = message_sent(client, {"Authorization": f"Bearer {tokens['access_token']}"}, context("同步候选人", "谢女士", "sync-source"))
+    sent = conversation_sync(client, {"Authorization": f"Bearer {tokens['access_token']}"}, context("同步候选人", "谢女士", "sync-source"))
     assert sent.status_code == 200, sent.text
 
     # The console now shows the plugin's BOSS sync data for this account.

@@ -25,7 +25,7 @@ export class PanelController {
       ? `<p class="identity-note">疑似同一候选人，已按不同岗位分别保留沟通记录</p>`
       : "";
     this.render(
-      `<button class="close">×</button><strong>${this.escape(data.ui.title)}</strong><p>${this.escape(data.ui.message)}</p>${note ? `<small class="watch-note">${this.escape(note)}</small>` : ""}${groupingNote}${data.matches.map((m) => `<small>${this.escape(m.recruiter_name)}｜${this.escape(m.job_name || "岗位未知")}｜${this.escape(m.stage === "FOLLOWING" ? "沟通中" : m.stage)}${m.first_contact_at ? `｜首次沟通 ${this.escape(this.time(m.first_contact_at))}` : ""}${m.updated_at ? `｜最近活动 ${this.escape(this.time(m.updated_at))}` : ""}${m.evidence_source === "BOSS_NATIVE" ? "｜BOSS已确认" : ""}</small>`).join("")}`,
+      `<button class="close">×</button><strong>${this.escape(data.ui.title)}</strong><p>${this.escape(data.ui.message)}</p>${note ? `<small class="watch-note">${this.escape(note)}</small>` : ""}${groupingNote}${data.matches.map((m) => `<small>${this.escape(m.is_own_history ? "你本人" : m.recruiter_name)}｜${this.escape(m.job_name || "岗位未知")}｜${this.escape(m.stage === "FOLLOWING" ? "沟通中" : m.stage)}${m.first_contact_at ? `｜首次沟通 ${this.escape(this.time(m.first_contact_at))}` : ""}${m.updated_at ? `｜最近活动 ${this.escape(this.time(m.updated_at))}` : ""}${m.evidence_source === "BOSS_NATIVE" ? "｜BOSS已确认" : ""}</small>`).join("")}`,
     );
     this.root
       .querySelector(".close")
