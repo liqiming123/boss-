@@ -1433,3 +1433,63 @@ def test_plugin_me_reports_the_assigned_boss_account(client, session):
     )
     session.commit()
     assert client.get("/api/v1/plugin/me", headers=headers).json()["boss_account_name"] == "谢女士"
+
+
+def test_legacy_scan_checkpoint_endpoints_stay_available(client, session):
+    """Extensions installed before per-row reconciliation read and write this
+    anchor during their own sweep. They were removed once and the resulting 404
+    aborted that sweep, so those machines stopped syncing until they were
+    updated. The original contract has to stay reachable."""
+    headers = login(client, "xie@example.com")
+    params = {"account_display_name": "谢女士", "platform": "boss"}
+
+    initial = client.get("/api/v1/plugin/conversations/checkpoint", headers=headers, params=params)
+    assert initial.status_code == 200
+    assert initial.json()["initial"] is True and initial.json()["historical_rescan"] is False
+
+    restarted = client.post("/api/v1/plugin/conversations/restart", headers=headers, params=params)
+    assert restarted.status_code == 200
+    assert restarted.json()["historical_rescan"] is True
+
+    after = client.get("/api/v1/plugin/conversations/checkpoint", headers=headers, params=params).json()
+    assert after["initial"] is False and after["historical_rescan"] is True
+    scan_id = after["cursor"]["scan_id"]
+
+    # A partial report must still be refused: it would move the mark past
+    # candidates that were never read.
+    partial = client.put(
+        "/api/v1/plugin/conversations/checkpoint",
+        headers=headers,
+        json={
+            "platform": "boss",
+            "account_display_name": "谢女士",
+            "completed_through_at": datetime.now(timezone.utc).isoformat(),
+            "cursor": {},
+        },
+    )
+    assert partial.status_code == 200 and partial.json()["accepted"] is False
+
+    # Only the tab carrying this rescan's server-issued id may complete it.
+    wrong = client.put(
+        "/api/v1/plugin/conversations/checkpoint",
+        headers=headers,
+        json={
+            "platform": "boss",
+            "account_display_name": "谢女士",
+            "completed_through_at": datetime.now(timezone.utc).isoformat(),
+            "cursor": {"complete": True, "scan_id": "someone-elses-rescan"},
+        },
+    )
+    assert wrong.status_code == 200 and wrong.json()["accepted"] is False
+
+    complete = client.put(
+        "/api/v1/plugin/conversations/checkpoint",
+        headers=headers,
+        json={
+            "platform": "boss",
+            "account_display_name": "谢女士",
+            "completed_through_at": datetime.now(timezone.utc).isoformat(),
+            "cursor": {"complete": True, "scan_id": scan_id},
+        },
+    )
+    assert complete.status_code == 200 and complete.json()["accepted"] is True
