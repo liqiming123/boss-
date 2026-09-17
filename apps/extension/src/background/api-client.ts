@@ -82,6 +82,7 @@ const LOGOUT_STORAGE_KEYS = [
   "accessToken",
   "refreshToken",
   "deviceId",
+  "accountDisplayName",
   "pendingFeishuLogin",
   "pendingMessageSentEvents",
   "pendingSnapshotUploads",

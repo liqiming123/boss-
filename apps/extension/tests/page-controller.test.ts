@@ -352,6 +352,7 @@ describe("Page controller candidate activation", () => {
     const initialSyncCalls = sendMessage.mock.calls.filter(
       ([message]) => message.type === "SYNC_CONVERSATION",
     );
+    console.log("LEAK PROBE:", JSON.stringify(initialSyncCalls.map(([m]) => ({ id: m.payload?.client_event_id, reason: m.payload?.sync_reason, name: m.payload?.candidate_display_name }))));
     expect(initialSyncCalls).toHaveLength(1);
     expect(initialSyncCalls[0][0].payload).toMatchObject({
       has_recruiter_outbound: false,
@@ -1562,5 +1563,71 @@ describe("Read-only conversation list watcher", () => {
     ).toHaveLength(1);
     controller.stopCatchup();
     dispose();
+  });  it("syncs under the recorded account name when the header cannot be read", async () => {
+    // Some BOSS builds render a header this parser cannot read. The name the
+    // recruiter confirmed at bind time has to carry the page instead: without
+    // it the bind succeeds and then every request stops on the unreadable
+    // header, which is exactly the state a live machine got stuck in.
+    const store: Record<string, unknown> = { accountDisplayName: "钱女士" };
+    const sendMessage = vi.fn().mockImplementation(({ type }: { type: string }) =>
+      Promise.resolve({
+        ok: true,
+        data:
+          type === "GET_AUTH"
+            ? { catchupEnabled: false }
+            : {
+                candidate_source_id: "source",
+                result_type: "NO_HISTORY",
+                ui: { severity: "success", title: "", message: "" },
+                matches: [],
+                available_actions: [],
+                account_mapping: {},
+                job_mapping: {},
+              },
+      }),
+    );
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: (
+            key: string | string[],
+            callback?: (value: Record<string, unknown>) => void,
+          ) => {
+            const keys = Array.isArray(key) ? key : [key];
+            const value = Object.fromEntries(
+              keys.filter((name) => store[name] !== undefined).map((name) => [name, store[name]]),
+            );
+            if (callback) {
+              callback(value);
+              return undefined;
+            }
+            return Promise.resolve(value);
+          },
+          set: (value: Record<string, unknown>) => {
+            Object.assign(store, value);
+            return Promise.resolve();
+          },
+        },
+        onChanged: { addListener: () => {} },
+      },
+    });
+    const adapter = new CandidateSwitchAdapter();
+    adapter.extractAccount = async () => ({
+      status: "ERROR",
+      errorCode: "BOSS_FIELDS_NOT_FOUND",
+    });
+    // Dispose at the end: a controller left running keeps dispatching through
+    // whatever chrome stub the next test installs.
+    const dispose = new PageController(adapter).start();
+    await eventually(() =>
+      sendMessage.mock.calls.some(([message]) => message.type === "CHECK_CONTEXT"),
+    );
+    const check = sendMessage.mock.calls.find(
+      ([message]) => message.type === "CHECK_CONTEXT",
+    )![0] as { payload: { account_display_name?: string } };
+    expect(check.payload.account_display_name).toBe("钱女士");
+    dispose();
   });
+
 });

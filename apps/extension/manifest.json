@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "招聘协同助手",
-  "version": "0.21.5",
+  "version": "0.21.8",
   "description": "自动读取 BOSS 招聘人员，支持飞书设备登录、候选人同步和重复跟进提醒",
   "permissions": [
     "storage",

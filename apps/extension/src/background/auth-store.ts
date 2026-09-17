@@ -8,6 +8,15 @@ export type AuthState = {
   accessToken?: string;
   refreshToken?: string;
   deviceId?: string;
+  /**
+   * The BOSS account name this device was bound to.
+   *
+   * Recorded at bind time from either the page header or the recruiter's manual
+   * entry, so a page whose header cannot be parsed still syncs under the same
+   * identity the recruiter confirmed. The server checks it against the device's
+   * assignment, so a stale value is rejected rather than written.
+   */
+  accountDisplayName?: string;
   pendingFeishuLogin?: PendingFeishuLogin;
   catchupEnabled: boolean;
 };
@@ -22,6 +31,7 @@ const keys: Array<keyof AuthState> = [
   "accessToken",
   "refreshToken",
   "deviceId",
+  "accountDisplayName",
   "pendingFeishuLogin",
   "catchupEnabled",
 ];

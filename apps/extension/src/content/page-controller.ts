@@ -353,19 +353,44 @@ export class PageController {
     private requestTimeoutMs = 8_000,
   ) {}
 
+  /**
+   * The BOSS account name recorded when this device was bound.
+   *
+   * Written by the popup from the header read or the recruiter's manual entry,
+   * and used here only when the page header cannot be parsed.
+   */
+  private async recordedAccountName(): Promise<string> {
+    try {
+      const stored = await chrome.storage.local.get(["accountDisplayName"]);
+      const value = stored.accountDisplayName;
+      return typeof value === "string" ? value.trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
   private async fields(): Promise<ResolvedFields | null> {
     const [c, j, account] = await Promise.all([
       this.adapter.extractCandidate(),
       this.adapter.extractJob(),
       this.adapter.extractAccount(),
     ]);
-    if (c.status === "ERROR" || j.status === "ERROR" || account.status === "ERROR") return null;
+    if (c.status === "ERROR" || j.status === "ERROR") return null;
     // The page account is the BOSS-side identity that the user is currently
     // operating. The API authenticates the device and verifies this name is
     // mapped to that recruiter; avoiding a blocking /plugin/me round-trip
     // keeps duplicate checks available even while the binding endpoint is
     // slow or temporarily unavailable.
-    const boundName = account.value.displayName;
+    //
+    // Some BOSS builds render a header this parser cannot read at all. Falling
+    // back to the name recorded at bind time — from the header or from the
+    // recruiter's own manual entry — keeps that machine on exactly the same
+    // path as one whose header parses: without it, the bind succeeds and then
+    // every sync, check and sweep stops at this line. The server still checks
+    // the name against the device's assignment, so a stale value is refused
+    // rather than written.
+    const readName = account.status === "OK" ? account.value.displayName.trim() : "";
+    const boundName = readName || (await this.recordedAccountName());
     if (!boundName) return null;
     const nativeCommunications = (c.value.nativeCommunications ?? []).filter(
       (item) => item.recruiterName !== boundName,
@@ -1025,11 +1050,18 @@ export class PageController {
       await delay(500);
       account = await this.adapter.extractAccount();
     }
-    if (account.status === "ERROR" || !account.value.displayName) {
-      this.scheduleCatchupRetry();
-      return;
+    // Same fallback as fields(): a header this build cannot read must not cost
+    // the sweep, because the sweep is what collects the long images and
+    // refreshes the shared table.
+    let accountDisplayName =
+      account.status === "OK" ? account.value.displayName.trim() : "";
+    if (!accountDisplayName) {
+      accountDisplayName = await this.recordedAccountName();
+      if (!accountDisplayName) {
+        this.scheduleCatchupRetry();
+        return;
+      }
     }
-    const accountDisplayName = account.value.displayName;
     const unreadStorageKey = `boss-catchup-unread:${accountDisplayName}`;
     const historyStorageKey = catchupHistoryKey(accountDisplayName);
     const persistedUnread = await readUnreadState(unreadStorageKey);
@@ -1379,8 +1411,14 @@ export class PageController {
     this.listWatchScanning = true;
     try {
       const account = await this.adapter.extractAccount();
-      if (this.stopped || account.status !== "OK" || !account.value.displayName) return;
-      const storageKey = listWatchStorageKey(account.value.displayName);
+      if (this.stopped) return;
+      // The list watcher is the read-only duplicate check for rows that move
+      // while another pane is open; an unreadable header must not switch it off.
+      const accountName =
+        account.status === "OK" ? account.value.displayName.trim() : "";
+      const effective = accountName || (await this.recordedAccountName());
+      if (!effective) return;
+      const storageKey = listWatchStorageKey(effective);
       if (storageKey !== this.listWatchStorageKey) {
         this.listWatchWatermark = new Map(
           Object.entries(await readListWatchState(storageKey)),
@@ -1428,7 +1466,7 @@ export class PageController {
         checks += 1;
         const response = await this.send(
           "CHECK_CONTEXT",
-          this.listRowPayload(account.value.displayName, parsed, row.activity),
+          this.listRowPayload(effective, parsed, row.activity),
         );
         if (this.stopped) return;
         if (!response.ok) continue; // Keep the old watermark and retry next round.

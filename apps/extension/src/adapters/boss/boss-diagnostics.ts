@@ -1,4 +1,43 @@
 import { bossSelectors } from "./boss-selectors";
+
+/**
+ * Shape-only description of the header lines the account parser inspects.
+ *
+ * A negative result cannot be debugged from a boolean: "the name is Latin",
+ * "the name carries parentheses" and "the header never rendered" all look the
+ * same. These facts separate them without shipping any page text: each line is
+ * reported as its length plus the character classes it contains.
+ */
+function headerShape() {
+  const values = (document.body?.innerText || "")
+    .replace(/ /g, " ")
+    .split(/\n+/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const marker = values.findIndex(
+    (value) => value === "升级VIP" || value === "账号权益",
+  );
+  const nearby = marker >= 0 ? values.slice(marker + 1, marker + 4) : values.slice(0, 3);
+  return {
+    accountChipFound: marker >= 0,
+    headerShapes: nearby.map((value) => `${value.length}:${charClasses(value)}`).join(" | "),
+  };
+}
+
+/** The character classes present in a value, never the value itself. */
+function charClasses(value: string) {
+  const tags: string[] = [];
+  if (/[一-鿿]/.test(value)) tags.push("CJK");
+  if (/[A-Za-z]/.test(value)) tags.push("LATIN");
+  if (/\d/.test(value)) tags.push("DIGIT");
+  if (/[·•]/.test(value)) tags.push("DOT");
+  if (/[（）()]/.test(value)) tags.push("PAREN");
+  if (/[，,。.;；!！?？]/.test(value)) tags.push("PUNCT");
+  if (/\s/.test(value)) tags.push("SPACE");
+  if (/[^一-鿿A-Za-z0-9_\-·•（）()\s]/.test(value)) tags.push("OTHER");
+  return tags.join("+") || "EMPTY";
+}
+
 export function bossDiagnostic() {
   const text = (document.body?.innerText || "").replace(/\s+/g, " ");
   const hasRecruiterShell = /职位管理|推荐牛人|牛人管理|招聘数据/.test(text);
@@ -30,6 +69,7 @@ export function bossDiagnostic() {
       hasCandidateSignals,
       hasJobSignals,
       iframeCount: document.querySelectorAll("iframe").length,
+      ...headerShape(),
     },
   };
 }

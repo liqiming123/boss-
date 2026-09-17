@@ -1,7 +1,7 @@
 {
-  "version": "0.21.5",
-  "published_at": "2026-09-16T09:04:17.435753+00:00",
-  "sha256": "f710d9c127dd0ccd699a55cdde587c67801518e4eb92fa59b6efb1a4eb7047d2",
+  "version": "0.21.8",
+  "published_at": "2026-09-17T06:30:47.218810+00:00",
+  "sha256": "907606b98ee92b5baaf42fc490590dcf1ca75563c1a57385d8c824262371fe51",
   "file_name": "recruitment-collab-extension.zip",
-  "size_bytes": 45280
+  "size_bytes": 46239
 }

@@ -8,7 +8,7 @@ root.innerHTML = `<style>
   :root{color-scheme:light}*{box-sizing:border-box}body{margin:0;width:340px;padding:18px;font:14px/1.45 system-ui;color:#172033;background:#fff}h2{margin:0 0 14px;font-size:20px}.version{color:#64748b;font-size:12px;font-weight:500}.account-card{padding:12px;border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc}.account-card p{margin:0}.account-card #status{margin-top:4px;font-size:13px}.muted{color:#64748b}.ok{color:#087f5b}.error{color:#b42318}button{width:100%;min-height:42px;padding:9px 12px;margin-top:12px;border:1px solid transparent;border-radius:8px;font:inherit;font-weight:600;cursor:pointer}.primary{background:#2156a5;color:#fff}.secondary{background:#fff;color:#334155;border-color:#cbd5e1}.danger{background:#fff;color:#b42318;border-color:#fecaca}button:disabled{opacity:.45;cursor:default}[hidden]{display:none!important}details{margin-top:12px;border-top:1px solid #e2e8f0;padding-top:10px}summary{color:#475569;cursor:pointer;user-select:none}.setting-note{margin:5px 2px -5px;color:#64748b;font-size:12px}input{width:100%;min-height:38px;margin-top:10px;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;font:inherit;box-sizing:border-box}input:focus{outline:2px solid #2156a5;outline-offset:-1px}
 </style>
 <h2>招聘协同助手 <span class="version">v${version}</span></h2>
-<div class="account-card"><p id="account" class="muted">读取绑定状态中…</p><p id="status">检查中…</p></div>
+<div class="account-card"><p id="account" class="muted">读取绑定状态中…</p><p id="status">检查中…</p><p id="pageHint" class="setting-note" hidden></p></div>
 <div id="manualRow" hidden><input id="manualAccount" placeholder="填写 BOSS 右上角显示的账号名" maxlength="100"><p class="setting-note">沟通页账号名读取失败时的备用方式：直接输入 BOSS 页面右上角显示的账号名，需与页面完全一致。</p></div>
 <button id="bind" class="primary">绑定飞书账号</button>
 <div id="dailyCard" class="account-card" style="margin-top:16px" hidden><p>公司招聘日报</p><p id="dailyStatus" class="muted">准备同步招聘数据</p><button id="dailyCheck" class="secondary">同步招聘数据</button></div>
@@ -22,7 +22,7 @@ root.innerHTML = `<style>
   <p class="setting-note">仅退出这台浏览器；不会影响其他招聘账号。</p>
   <button id="logout" class="danger">退出此浏览器登录</button>
 </details>`;
-const account = root.querySelector<HTMLElement>("#account")!, status = root.querySelector<HTMLElement>("#status")!, bind = root.querySelector<HTMLButtonElement>("#bind")!, rebind = root.querySelector<HTMLButtonElement>("#rebind")!, unbind = root.querySelector<HTMLButtonElement>("#unbind")!, restart = root.querySelector<HTMLButtonElement>("#restart")!, logout = root.querySelector<HTMLButtonElement>("#logout")!, adminButton = root.querySelector<HTMLButtonElement>("#adminButton")!, more = root.querySelector<HTMLDetailsElement>("#more")!, dailyCard = root.querySelector<HTMLElement>("#dailyCard")!, manualRow = root.querySelector<HTMLElement>("#manualRow")!, manualAccount = root.querySelector<HTMLInputElement>("#manualAccount")!;
+const account = root.querySelector<HTMLElement>("#account")!, status = root.querySelector<HTMLElement>("#status")!, bind = root.querySelector<HTMLButtonElement>("#bind")!, rebind = root.querySelector<HTMLButtonElement>("#rebind")!, unbind = root.querySelector<HTMLButtonElement>("#unbind")!, restart = root.querySelector<HTMLButtonElement>("#restart")!, logout = root.querySelector<HTMLButtonElement>("#logout")!, adminButton = root.querySelector<HTMLButtonElement>("#adminButton")!, more = root.querySelector<HTMLDetailsElement>("#more")!, dailyCard = root.querySelector<HTMLElement>("#dailyCard")!, manualRow = root.querySelector<HTMLElement>("#manualRow")!, manualAccount = root.querySelector<HTMLInputElement>("#manualAccount")!, pageHint = root.querySelector<HTMLElement>("#pageHint")!;
 async function openAdmin() { const a = await getAuth(); await chrome.tabs.create({url: `${a.apiBaseUrl.replace(/\/api\/v1\/?$/, "")}/recruitment/overview`}); }
 adminButton.onclick = () => void openAdmin();
 async function poll(p: PendingFeishuLogin) {
@@ -53,14 +53,34 @@ async function load() {
     // show that name — not just the bound Feishu recruiter. A blank read while
     // a BOSS tab is open is the one state the recruiter has to act on, and it
     // used to be invisible until they tried to bind.
-    const page = await readPageAccount(1);
-    account.textContent = page.name ? `BOSS 账号：${page.name}｜招聘人：${me.display_name}` : `当前招聘人：${me.display_name}`;
-    if (page.name || !page.tab) {
-      status.className = "ok";
-      status.textContent = page.name ? "● 已连接，自动同步已开启" : "● 已连接｜打开 BOSS 沟通页后自动同步";
+    const page = await readPageAccount(3);
+    // The name the page shows wins; the one recorded at bind time stands in for
+    // a header this build cannot read, and syncing continues under it.
+    const recorded = (current.accountDisplayName ?? "").trim();
+    const effective = page.name || recorded;
+    account.textContent = effective
+      ? `BOSS 账号：${effective}${page.name ? "" : "（绑定时记录）"}｜招聘人：${me.display_name}`
+      : `当前招聘人：${me.display_name}`;
+    // Binding is server state and stays "connected" regardless of the page
+    // read: replacing 已连接 with an error made a healthy bind look broken
+    // whenever the header could not be parsed (stale tab, slow paint). The
+    // page-read problem is real — auto sync cannot start without the account
+    // name — so it gets its own remediation line instead of hijacking status.
+    status.className = "ok";
+    if (page.name) {
+      status.textContent = "● 已连接，自动同步已开启";
+      pageHint.hidden = true;
+    } else if (!page.tab) {
+      status.textContent = recorded ? "● 已连接，自动同步已开启" : "● 已连接｜打开 BOSS 沟通页后自动同步";
+      pageHint.hidden = true;
     } else {
-      status.className = "error";
-      status.textContent = "未识别到 BOSS 右上角账号名：请刷新 BOSS 沟通页（F5）后重新打开本窗口";
+      status.textContent = recorded ? "● 已连接，自动同步已开启" : "● 已连接";
+      pageHint.hidden = false;
+      pageHint.textContent = page.reachable
+        ? recorded
+          ? `读不到 BOSS 右上角账号名，已改用绑定时记录的「${recorded}」继续同步。若账号已更换，请刷新该页面（F5）后重新打开本窗口。诊断信息：${page.reason}`
+          : `BOSS 沟通页已打开，但暂时读不到右上角账号名：请刷新该页面（F5）后重新打开本窗口，或在下方手动填写账号名后重新绑定。诊断信息：${page.reason}`
+        : `扩展还没有接入这个 BOSS 沟通页标签：请刷新该页面（F5）；如果刚更新过扩展，先在扩展管理页对本扩展点击“重新加载”再刷新页面。绑定本身正常。诊断信息：${page.reason}`;
     }
     showBoundUi(true);
     const isAdmin=me.role.toUpperCase()==="ADMIN";
@@ -89,14 +109,16 @@ async function currentBossTab() {
 /**
  * Read the BOSS account name the page shows in its top-right header.
  *
- * `tab` reports whether a BOSS communication tab was found at all, so callers
- * can tell "no page to read" apart from "the page is there but its account
- * name could not be recognised" — two states with different fixes.
+ * `tab` reports whether a BOSS communication tab was found at all, and
+ * `reachable` whether a content script answered inside it — together they
+ * separate "no page to read", "the extension was (re)loaded after the tab was
+ * opened so no content script is in it yet", and "the page is there but its
+ * account name could not be recognised", three states with different fixes.
  */
-async function readPageAccount(attempts: number): Promise<{ tab: boolean; name: string }> {
+async function readPageAccount(attempts: number): Promise<{ tab: boolean; name: string; reachable: boolean; reason: string }> {
   const tab = await currentBossTab();
   if (!tab?.id || !tab.url)
-    return { tab: false, name: "" };
+    return { tab: false, name: "", reachable: false, reason: "" };
   // The BOSS shell paints its header in stages, and an extension installed
   // while the page was already open has no content script in that tab until the
   // page is reloaded. Retry briefly so a slow paint is not mistaken for an
@@ -105,14 +127,28 @@ async function readPageAccount(attempts: number): Promise<{ tab: boolean; name: 
     try {
       const response = await chrome.tabs.sendMessage(tab.id, { type: "GET_PAGE_ACCOUNT" });
       const name = response?.ok && typeof response.displayName === "string" ? response.displayName.trim() : "";
-      if (name) return { tab: true, name };
+      if (name) return { tab: true, name, reachable: true, reason: "" };
+      // A well-formed reply means the content script is alive even when it
+      // could not parse the header. The code it reports separates "this tab is
+      // not a chat shell" from "the header could not be read", and the page
+      // path is the fastest way to tell which page the extension is looking at.
+      if (response && typeof response === "object")
+        return { tab: true, name: "", reachable: true, reason: `${String((response as { error?: string }).error || "UNKNOWN")}@${pagePath(tab.url)}` };
     } catch {
-      // No content script in this tab yet.
+      // No content script in this tab yet; retry after a short pause.
     }
     if (attempt + 1 < attempts)
       await new Promise((resolve) => window.setTimeout(resolve, 800));
   }
-  return { tab: true, name: "" };
+  return { tab: true, name: "", reachable: false, reason: pagePath(tab.url) };
+}
+/** The path of the BOSS tab, without query or fragment, for the failure hint. */
+function pagePath(url: string) {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return "";
+  }
 }
 async function currentBossAccount() {
   return (await readPageAccount(3)).name;
@@ -140,7 +176,10 @@ async function start(action:"bind"|"unbind") {
   // Chromium derivatives (Edge, Opera) are identified so the admin device
   // list does not label every browser "Chrome".
   const r=await apiRequest<Start>("/plugin/feishu-binding/start",{method:"POST",body:JSON.stringify({account_display_name:accountDisplayName,action,device_id:deviceId,device_name:`${/\bEdg\//.test(navigator.userAgent)?"Edge":/\bOPR\//.test(navigator.userAgent)?"Opera":"Chrome"} ${navigator.platform}`})});
-  if(action==="bind") await setAuth({deviceId,pendingFeishuLogin:{attemptId:r.attempt_id,pollToken:r.poll_token,expiresAt:Date.now()+r.expires_in*1000}}); else await chrome.storage.local.remove("pendingFeishuLogin");
+  // The name is remembered whether it came from the header or from the manual
+  // field, so a page whose header cannot be parsed still syncs under the
+  // identity the recruiter just confirmed instead of stopping every request.
+  if(action==="bind") await setAuth({deviceId,accountDisplayName,pendingFeishuLogin:{attemptId:r.attempt_id,pollToken:r.poll_token,expiresAt:Date.now()+r.expires_in*1000}}); else await chrome.storage.local.remove("pendingFeishuLogin");
   await chrome.tabs.create({url:r.authorization_url});
 }
 async function showDailyStatus(){
