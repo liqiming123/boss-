@@ -568,9 +568,28 @@ def me(actor: Actor = Depends(current_actor), db: Session = Depends(get_db)) -> 
 
 @router.get("/plugin/me")
 def plugin_me(actor: Actor = Depends(plugin_actor), db: Session = Depends(get_db)) -> dict[str, str]:
-    """Return the bound Feishu display name used as the sync recruiter."""
+    """Return the bound Feishu display name used as the sync recruiter.
+
+    ``boss_account_name`` is the BOSS account this device is assigned to. The
+    extension records it as the account it syncs under, so a page whose header
+    cannot be parsed still runs the normal flow instead of stopping every
+    request — and the name comes from the assignment rather than from a retyped
+    string, which a typo would turn into a rejected sync.
+    """
     recruiter = db.get(Recruiter, actor.id)
-    return {"display_name": recruiter.feishu_display_name if recruiter and recruiter.feishu_display_name else actor.display_name, "role": actor.role}
+    assignment = db.scalar(
+        select(BossAccountAssignment).where(
+            BossAccountAssignment.company_id == actor.company_id,
+            BossAccountAssignment.feishu_recruiter_id == actor.id,
+            BossAccountAssignment.status == "ACTIVE",
+        )
+    )
+    account = db.get(RecruitmentAccount, assignment.boss_account_id) if assignment else None
+    return {
+        "display_name": recruiter.feishu_display_name if recruiter and recruiter.feishu_display_name else actor.display_name,
+        "role": actor.role,
+        "boss_account_name": account.account_display_name if account else "",
+    }
 
 
 @router.post("/auth/feishu/web/start")

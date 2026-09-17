@@ -48,15 +48,21 @@ async function load() {
     if (a.pendingFeishuLogin && !(await poll(a.pendingFeishuLogin))) return;
     const current = await getAuth();
     if (!current.accessToken) { account.textContent="尚未连接招聘账号"; status.className="muted"; status.textContent="绑定飞书后即可同步和接收提醒"; showBoundUi(false); return; }
-    const me = await apiRequest<{display_name:string;role:string}>("/plugin/me");
-    // Every sync writes against the BOSS account read from the page header, so
-    // show that name — not just the bound Feishu recruiter. A blank read while
-    // a BOSS tab is open is the one state the recruiter has to act on, and it
-    // used to be invisible until they tried to bind.
+    const me = await apiRequest<{display_name:string;role:string;boss_account_name?:string}>("/plugin/me");
+    // Every sync writes against the BOSS account this device operates on.
     const page = await readPageAccount(3);
-    // The name the page shows wins; the one recorded at bind time stands in for
-    // a header this build cannot read, and syncing continues under it.
-    const recorded = (current.accountDisplayName ?? "").trim();
+    // The page wins when it is readable, and is then remembered. Otherwise the
+    // name recorded earlier — or the one the server holds for this device's
+    // assignment — carries the sync, so a machine whose header cannot be parsed
+    // keeps working without anyone retyping the account name.
+    let recorded = (current.accountDisplayName ?? "").trim();
+    if (page.name && page.name !== recorded) {
+      recorded = page.name;
+      await setAuth({ accountDisplayName: page.name });
+    } else if (!recorded && me.boss_account_name) {
+      recorded = me.boss_account_name;
+      await setAuth({ accountDisplayName: me.boss_account_name });
+    }
     const effective = page.name || recorded;
     account.textContent = effective
       ? `BOSS 账号：${effective}${page.name ? "" : "（绑定时记录）"}｜招聘人：${me.display_name}`

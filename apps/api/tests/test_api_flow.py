@@ -1411,3 +1411,25 @@ def test_job_label_canonicalization_strips_page_and_chat_tails():
     assert _canonical_job_name("AI短视频内容生成师 10:33") == "AI短视频内容生成师"
     # A title that contains nothing but the tail is kept rather than emptied.
     assert _canonical_job_name("您好") == "您好"
+
+
+def test_plugin_me_reports_the_assigned_boss_account(client, session):
+    """The header-less fallback reads this name, so it must come from the
+    device's assignment rather than from a retyped string."""
+    recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
+    account = session.scalar(
+        select(RecruitmentAccount).where(RecruitmentAccount.account_display_name == "谢女士")
+    )
+    headers = login(client, "xie@example.com")
+    assert client.get("/api/v1/plugin/me", headers=headers).json()["boss_account_name"] == ""
+
+    session.add(
+        BossAccountAssignment(
+            company_id=recruiter.company_id,
+            boss_account_id=account.id,
+            feishu_recruiter_id=recruiter.id,
+            feishu_display_name=recruiter.display_name,
+        )
+    )
+    session.commit()
+    assert client.get("/api/v1/plugin/me", headers=headers).json()["boss_account_name"] == "谢女士"
