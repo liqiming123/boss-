@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # therefore re-notified after this many minutes instead of the old fixed
     # 24-hour window. Set 0 to notify on every detection.
     lookup_alert_cooldown_minutes: int = 30
+    # A duplicate is announced twice: the lookup card warns whoever is about to
+    # contact the candidate, and the conflict card tells both holders. Sending
+    # both about the same person inside this window is the same fact twice, so
+    # a conflict card is suppressed for a recipient who already received a
+    # lookup card about that candidate. Set 0 to always send both.
+    conflict_card_quiet_minutes: int = 720
     candidate_cache_days: int = 30
     diagnostic_retention_days: int = 30
     event_retention_days: int = 90

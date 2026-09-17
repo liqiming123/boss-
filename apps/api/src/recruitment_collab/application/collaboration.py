@@ -1813,14 +1813,21 @@ class RecruitmentCollaborationService:
         for match in matches:
             if match["match_level"] not in {"CONFIRMED_PLATFORM_ID", "EXACT_IDENTITY", "SUSPECTED_SAME_NAME_JOB"}:
                 continue
-            identity_key = (
-                source.platform_candidate_id
-                if match["match_level"] == "CONFIRMED_PLATFORM_ID"
-                else source.candidate_identity_signature
-                if match["match_level"] == "EXACT_IDENTITY"
-                else source.candidate_normalized_name
-            )
-            key = conflict_key(company_id, source.job_id, identity_key or source.source_identity_key, actor_id, match["recruiter_id"])
+            # A conflict is between two people. The same recruiter holding the
+            # candidate under a second job is their own follow-up, not a
+            # conflict — it opened a self-conflict and sent a card naming the
+            # recipient as their own counterpart.
+            if match.get("recruiter_id") and match["recruiter_id"] == actor_id:
+                continue
+            # Key the conflict on the *person*, not on the row that carried the
+            # evidence. Including the job and the profile signature split one
+            # candidate into several conflicts — 张昕培 produced three in a
+            # single day, each with its own pair of cards — because a cross-job
+            # duplicate and a re-hydrated profile card are still the same two
+            # recruiters holding the same person. The platform id is the
+            # strongest person key; the normalised name is the stable fallback.
+            identity_key = source.platform_candidate_id or source.candidate_normalized_name
+            key = conflict_key(company_id, None, identity_key or source.source_identity_key, actor_id, match["recruiter_id"])
             conflict = self.session.scalar(select(Conflict).where(Conflict.conflict_key == key))
             if conflict and conflict.status not in {"CLOSED", "NOT_SAME_PERSON"}:
                 conflict.last_detected_at = now()
@@ -1855,17 +1862,48 @@ class RecruitmentCollaborationService:
         recipient here instead. ``_queue_notifications`` derives the
         idempotency key from the recipient, so two payloads for one conflict
         stay two independently deduplicated rows.
+
+        A recipient the lookup card already warned about this candidate is
+        skipped: one duplicate must not arrive as two different cards.
         """
         sides = {
             conflict.left_recruiter_id: conflict.left_candidate_source_id,
             conflict.right_recruiter_id: conflict.right_candidate_source_id,
         }
+        left_source = self.session.get(CandidateSource, conflict.left_candidate_source_id)
+        right_source = self.session.get(CandidateSource, conflict.right_candidate_source_id)
+        # The same identity the lookup path stores on its alert, so the two
+        # channels agree on what "this candidate" means.
+        candidate_identity = (
+            (left_source.candidate_identity_signature if left_source else None)
+            or (right_source.candidate_identity_signature if right_source else None)
+            or hashlib.sha256(CandidateNameNormalizer().normalize(candidate_name).encode()).hexdigest()
+        )
+        quiet_minutes = get_settings().conflict_card_quiet_minutes
+        quiet_since = now() - timedelta(minutes=quiet_minutes) if quiet_minutes else None
         for recipient_id, counterpart_source_id in sides.items():
             counterpart_id = next(
                 (recruiter_id for recruiter_id in sides if recruiter_id != recipient_id),
                 None,
             )
             counterpart = self.session.get(CandidateSource, counterpart_source_id)
+            # Whoever the lookup card already warned about this candidate does
+            # not need the conflict card as well: it carries the same fact.
+            if quiet_since is not None and self.session.scalar(
+                select(DuplicateLookupAlert.id)
+                .where(
+                    DuplicateLookupAlert.company_id == conflict.company_id,
+                    DuplicateLookupAlert.candidate_identity_hash == candidate_identity,
+                    DuplicateLookupAlert.last_notified_at.isnot(None),
+                    DuplicateLookupAlert.last_notified_at >= quiet_since,
+                    or_(
+                        DuplicateLookupAlert.viewer_recruiter_id == recipient_id,
+                        DuplicateLookupAlert.matched_recruiter_id == recipient_id,
+                    ),
+                )
+                .limit(1)
+            ):
+                continue
             counterpart_recruiter = self.session.get(Recruiter, counterpart_id) if counterpart_id else None
             payload = {
                 "type": "DUPLICATE_CANDIDATE",

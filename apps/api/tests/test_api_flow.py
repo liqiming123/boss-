@@ -1463,3 +1463,46 @@ def test_conflict_cards_name_the_counterpart_instead_of_unknown(client, session)
         assert payload["first_contact_at"], "首次沟通 must not render as 未知"
         assert payload["last_activity_at"], "最近活动 must not render as 未知"
         assert payload["job_name"] == "短视频编导"
+
+
+def test_conflicts_are_keyed_on_the_person_not_the_job(client, session):
+    """One candidate pair is one conflict, whatever job a scan carried.
+
+    Including the job and the profile signature in the key split one candidate
+    into several conflicts — 张昕培 produced three in a day, each firing its own
+    pair of cards.
+    """
+    xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
+    for recruiter in session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all():
+        recruiter.feishu_open_id = f"open-{recruiter.id}"
+    session.commit()
+
+    first = context("张昕培", "谢女士", "person-key-1")
+    first["job_display_name"] = "短视频编导"
+    assert conversation_sync(client, xie, first, "2026-09-15T10:00:00+08:00").status_code == 200
+
+    second = context("张昕培", "珈莉", "person-key-2")
+    second["job_display_name"] = "直播助播"
+    assert conversation_sync(client, jiali, second, "2026-09-15T11:00:00+08:00").status_code == 200
+    assert session.scalar(select(func.count()).select_from(Conflict)) == 1
+
+    # The same two recruiters meeting the same person under a third job must
+    # reuse that conflict rather than open a new one with a new pair of cards.
+    third = context("张昕培", "谢女士", "person-key-3")
+    third["job_display_name"] = "财务主管"
+    assert conversation_sync(client, xie, third, "2026-09-15T12:00:00+08:00").status_code == 200
+    assert session.scalar(select(func.count()).select_from(Conflict)) == 1
+    assert (
+        session.scalar(
+            select(func.count())
+            .select_from(NotificationOutbox)
+            .where(NotificationOutbox.event_type == "CONFLICT_CREATED")
+        )
+        == 2
+    )
+    # A recruiter meeting their own cross-job row is their own follow-up, not a
+    # conflict: it used to open a second conflict naming them as themselves.
+    assert all(
+        conflict.left_recruiter_id != conflict.right_recruiter_id
+        for conflict in session.scalars(select(Conflict)).all()
+    )
