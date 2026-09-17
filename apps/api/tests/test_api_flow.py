@@ -1433,3 +1433,33 @@ def test_plugin_me_reports_the_assigned_boss_account(client, session):
     )
     session.commit()
     assert client.get("/api/v1/plugin/me", headers=headers).json()["boss_account_name"] == "谢女士"
+
+
+def test_conflict_cards_name_the_counterpart_instead_of_unknown(client, session):
+    """Both sides are told about the *other* recruiter, with that side's times.
+
+    One shared payload left the counterpart's name and both timestamps as 未知
+    on every conflict card.
+    """
+    xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
+    for recruiter in session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all():
+        recruiter.feishu_open_id = f"open-{recruiter.id}"
+    session.commit()
+    assert conversation_sync(client, xie, context("冲突文案候选人", "谢女士", "copy-first"), "2026-09-15T10:00:00+08:00").status_code == 200
+    assert conversation_sync(client, jiali, context("冲突文案候选人", "珈莉", "copy-second"), "2026-09-15T11:00:00+08:00").status_code == 200
+
+    cards = session.scalars(
+        select(NotificationOutbox).where(NotificationOutbox.event_type == "CONFLICT_CREATED")
+    ).all()
+    assert len(cards) == 2
+    by_recipient = {card.recipient_recruiter_id: card.payload_json for card in cards}
+    xie_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "谢女士"))
+    jiali_recruiter = session.scalar(select(Recruiter).where(Recruiter.display_name == "珈莉"))
+
+    # Each card names the other side, never its own recipient.
+    assert by_recipient[jiali_recruiter.id]["matched_recruiter_name"] == "谢女士"
+    assert by_recipient[xie_recruiter.id]["matched_recruiter_name"] == "珈莉"
+    for payload in by_recipient.values():
+        assert payload["first_contact_at"], "首次沟通 must not render as 未知"
+        assert payload["last_activity_at"], "最近活动 must not render as 未知"
+        assert payload["job_name"] == "短视频编导"

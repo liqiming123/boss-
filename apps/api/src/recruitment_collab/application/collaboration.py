@@ -1847,22 +1847,48 @@ class RecruitmentCollaborationService:
         return conflict_ids
 
     def _queue_conflict_notifications(self, conflict: Conflict, candidate_name: str, match_reason: str, recruiter_ids: tuple[str, str]) -> None:
-        payload = {
-            "type": "DUPLICATE_CANDIDATE",
-            "conflict_id": conflict.id,
-            "candidate_name": candidate_name,
-            "job_id": conflict.job_id,
-            "match_reason": match_reason,
+        """Warn both recruiters, each told about the *other* side.
+
+        A conflict card names the counterpart recruiter, their first contact and
+        their last activity. One shared payload carries none of those per-side
+        facts, so every card rendered them as 未知 — the card is built per
+        recipient here instead. ``_queue_notifications`` derives the
+        idempotency key from the recipient, so two payloads for one conflict
+        stay two independently deduplicated rows.
+        """
+        sides = {
+            conflict.left_recruiter_id: conflict.left_candidate_source_id,
+            conflict.right_recruiter_id: conflict.right_candidate_source_id,
         }
-        self._queue_notifications(
-            conflict.company_id,
-            "CONFLICT_CREATED",
-            "conflict",
-            conflict.id,
-            payload,
-            recruiter_ids,
-            f"conflict:{conflict.id}:v1",
-        )
+        for recipient_id, counterpart_source_id in sides.items():
+            counterpart_id = next(
+                (recruiter_id for recruiter_id in sides if recruiter_id != recipient_id),
+                None,
+            )
+            counterpart = self.session.get(CandidateSource, counterpart_source_id)
+            counterpart_recruiter = self.session.get(Recruiter, counterpart_id) if counterpart_id else None
+            payload = {
+                "type": "DUPLICATE_CANDIDATE",
+                "conflict_id": conflict.id,
+                "candidate_name": candidate_name,
+                "job_id": conflict.job_id,
+                # The counterpart's job and contact times, so the card reads
+                # like the duplicate-lookup one instead of a row of 未知.
+                "job_name": counterpart.raw_job_name if counterpart else "",
+                "matched_recruiter_name": self._recruiter_label(counterpart_recruiter, "其他招聘者"),
+                "first_contact_at": _iso_time(counterpart.conversation_started_at) if counterpart else None,
+                "last_activity_at": _iso_time(counterpart.conversation_updated_at) if counterpart else None,
+                "match_reason": match_reason,
+            }
+            self._queue_notifications(
+                conflict.company_id,
+                "CONFLICT_CREATED",
+                "conflict",
+                conflict.id,
+                payload,
+                (recipient_id,),
+                f"conflict:{conflict.id}:v1",
+            )
 
     def exclude_conflict(self, conflict_id: str, actor_id: str, company_id: str, reason: str) -> None:
         conflict = self.session.get(Conflict, conflict_id)
