@@ -1866,6 +1866,13 @@ class RecruitmentCollaborationService:
         A recipient the lookup card already warned about this candidate is
         skipped: one duplicate must not arrive as two different cards.
         """
+        if not get_settings().conflict_cards_enabled:
+            # The conflict row itself is written either way — the console and
+            # the in-page panel still show it. Only the card is suppressed, in
+            # favour of the lookup card that fires when someone is about to
+            # contact a duplicate, which is the moment a warning can change
+            # what happens.
+            return
         sides = {
             conflict.left_recruiter_id: conflict.left_candidate_source_id,
             conflict.right_recruiter_id: conflict.right_candidate_source_id,

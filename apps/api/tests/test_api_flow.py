@@ -477,11 +477,11 @@ def test_duplicate_lookup_targets_previous_recruiter_when_their_activity_is_newe
     assert recipients == {colleague.id}
 
 
-def test_a_newly_synced_row_still_notifies_both_recruiters_about_the_conflict(client, session):
-    """Only the browse warning is viewer-only; a genuine conflict stays bilateral.
+def test_a_newly_synced_row_records_the_conflict_without_its_own_card(client, session):
+    """A genuine conflict is recorded when the second row is synced.
 
-    Rows are created by the sync paths, so the persistent conflict and its
-    bilateral notifications now fire when the second row is synced.
+    Its card is off by default: the lookup card already warns whoever is about
+    to contact the duplicate, which is when a warning can change what happens.
     """
     xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
     for recruiter in session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all():
@@ -491,14 +491,14 @@ def test_a_newly_synced_row_still_notifies_both_recruiters_about_the_conflict(cl
     assert conversation_sync(client, jiali, context("冲突提醒候选人", "珈莉", "conflict-second")).status_code == 200
     conflict = session.scalar(select(Conflict))
     assert conflict is not None
-    recipients = set(
-        session.scalars(
-            select(NotificationOutbox.recipient_recruiter_id).where(
-                NotificationOutbox.event_type == "CONFLICT_CREATED"
-            )
-        ).all()
+    assert (
+        session.scalar(
+            select(func.count())
+            .select_from(NotificationOutbox)
+            .where(NotificationOutbox.event_type == "CONFLICT_CREATED")
+        )
+        == 0
     )
-    assert len(recipients) == 2
 
 
 def test_same_recruiter_same_name_and_job_with_different_age_stays_separate(client, session):
@@ -1435,12 +1435,19 @@ def test_plugin_me_reports_the_assigned_boss_account(client, session):
     assert client.get("/api/v1/plugin/me", headers=headers).json()["boss_account_name"] == "谢女士"
 
 
-def test_conflict_cards_name_the_counterpart_instead_of_unknown(client, session):
+def test_conflict_cards_name_the_counterpart_instead_of_unknown(client, session, monkeypatch):
     """Both sides are told about the *other* recruiter, with that side's times.
 
     One shared payload left the counterpart's name and both timestamps as 未知
     on every conflict card.
     """
+    from recruitment_collab.application import collaboration as collaboration_module
+
+    monkeypatch.setattr(
+        collaboration_module,
+        "get_settings",
+        lambda: get_settings().model_copy(update={"conflict_cards_enabled": True}),
+    )
     xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
     for recruiter in session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all():
         recruiter.feishu_open_id = f"open-{recruiter.id}"
@@ -1465,13 +1472,20 @@ def test_conflict_cards_name_the_counterpart_instead_of_unknown(client, session)
         assert payload["job_name"] == "短视频编导"
 
 
-def test_conflicts_are_keyed_on_the_person_not_the_job(client, session):
+def test_conflicts_are_keyed_on_the_person_not_the_job(client, session, monkeypatch):
     """One candidate pair is one conflict, whatever job a scan carried.
 
     Including the job and the profile signature in the key split one candidate
     into several conflicts — 张昕培 produced three in a day, each firing its own
     pair of cards.
     """
+    from recruitment_collab.application import collaboration as collaboration_module
+
+    monkeypatch.setattr(
+        collaboration_module,
+        "get_settings",
+        lambda: get_settings().model_copy(update={"conflict_cards_enabled": True}),
+    )
     xie, jiali = login(client, "xie@example.com"), login(client, "jiali@example.com")
     for recruiter in session.scalars(select(Recruiter).where(Recruiter.display_name.in_({"谢女士", "珈莉"}))).all():
         recruiter.feishu_open_id = f"open-{recruiter.id}"

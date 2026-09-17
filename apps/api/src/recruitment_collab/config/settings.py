@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     # a conflict card is suppressed for a recipient who already received a
     # lookup card about that candidate. Set 0 to always send both.
     conflict_card_quiet_minutes: int = 720
+    # Whether a conflict also sends its own Feishu card. Off by default: the
+    # lookup card already reaches whoever is about to contact a duplicate, and
+    # that is the moment the warning can change what happens. The conflict row
+    # itself is always recorded, so the console and the in-page panel keep the
+    # full picture, and a team that wants the extra notification can turn this
+    # back on without a code change.
+    conflict_cards_enabled: bool = False
     candidate_cache_days: int = 30
     diagnostic_retention_days: int = 30
     event_retention_days: int = 90
